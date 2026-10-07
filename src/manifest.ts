@@ -44,19 +44,22 @@ export interface RouterManifest {
 }
 
 /**
- * Package lines whose release documents this router reads. For 0.x versions the minor is the
- * compatibility line (caret semantics). Kept equal to package.json's dependency ranges (tested).
+ * Package lines a release's recorded build-time versions must fall in. For 0.x versions the minor is
+ * the compatibility line (caret semantics); kept equal to package.json's dependency range (tested).
+ * Only embedding-classifier is checked: its artifacts carry no format version, so its line is what
+ * keeps a classifier scored by the code it was evaluated with. Rule sets, document pipelines, evidence
+ * and manifests carry their own format versions, which loading validates.
  */
 export const COMPATIBLE_PACKAGES: Readonly<Record<string, string>> = Object.freeze({
   '@liquidau/embedding-classifier': '0.8',
-  '@liquidau/rule-miner': '0.5',
-  '@liquidau/router': '0.1',
-  '@liquidau/text-preprocessing': '0.1',
 });
+
+/** Packages every manifest records (provenance), plus text-preprocessing for document releases. */
+const RECORDED_PACKAGES = ['@liquidau/embedding-classifier', '@liquidau/rule-miner', '@liquidau/router'] as const;
 
 /** Packages a manifest must record: text-preprocessing only for document releases. */
 export const requiredPackages = (schema: RouterManifest['schema']): string[] =>
-  Object.keys(COMPATIBLE_PACKAGES).filter((name) => name !== '@liquidau/text-preprocessing' || schema === MANIFEST_SCHEMA_DOCUMENT);
+  [...RECORDED_PACKAGES, ...(schema === MANIFEST_SCHEMA_DOCUMENT ? ['@liquidau/text-preprocessing'] : [])];
 
 const SEGMENT = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
 

@@ -27,7 +27,7 @@ export interface BuildReleaseInput {
   keys?: Partial<Record<'classifier' | 'rules' | 'policy' | 'evidence', string>>;
   embedding: EncoderIdentity;
   serving: { maxInputUtf8Bytes: number };
-  /** Exact build-time versions of at least the packages in COMPATIBLE_PACKAGES. */
+  /** Exact build-time versions of at least the packages requiredPackages lists (embedding-classifier, rule-miner, router; text-preprocessing for document releases). */
   packages: Record<string, string>;
 }
 

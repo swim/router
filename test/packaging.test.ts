@@ -43,12 +43,12 @@ function resolveDir(from: string, name: string): string {
   }
 }
 
-test('COMPATIBLE_PACKAGES matches package.json ranges and the router version', () => {
+test('COMPATIBLE_PACKAGES matches package.json ranges', () => {
   const p = pkg(root);
-  assert.equal(COMPATIBLE_PACKAGES['@liquidau/router'], p.version.split('.').slice(0, 2).join('.'));
-  for (const name of ['@liquidau/embedding-classifier', '@liquidau/rule-miner', '@liquidau/text-preprocessing']) {
+  assert.deepEqual(Object.keys(COMPATIBLE_PACKAGES), ['@liquidau/embedding-classifier'], 'only the classifier, whose artifacts have no format version, is gated by line');
+  for (const [name, line] of Object.entries(COMPATIBLE_PACKAGES)) {
     const range = p.dependencies![name];
     assert.match(range, /^\^0\.\d+\.\d+$/);
-    assert.equal(COMPATIBLE_PACKAGES[name], range.slice(1).split('.').slice(0, 2).join('.'));
+    assert.equal(line, range.slice(1).split('.').slice(0, 2).join('.'));
   }
 });
