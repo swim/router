@@ -1,0 +1,58 @@
+{
+  "name": "@liquidau/router",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Validates an immutable classifier + rules + policy + evidence bundle, settles requests with certified rules first, embeds and scores only when needed, and returns enforce or shadow route decisions.",
+  "keywords": [
+    "routing",
+    "embeddings",
+    "classifier",
+    "rules",
+    "release-validation",
+    "edge"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "@liquidau/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./evaluation": {
+      "@liquidau/source": "./src/evaluation/index.ts",
+      "types": "./dist/evaluation/index.d.ts",
+      "default": "./dist/evaluation/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.portable.json",
+    "check:portable": "node scripts/check-portable.mjs",
+    "link:siblings": "node scripts/link-siblings.mjs"
+  },
+  "dependencies": {
+    "@liquidau/embedding-classifier": "^0.8.0",
+    "@liquidau/rule-miner": "^0.5.1",
+    "@liquidau/text-preprocessing": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "//": "Type-checks the shipped source with no Node types: any Node global or built-in import fails here. DOM supplies the Web platform types (TextEncoder, AbortController, crypto.subtle) the router relies on.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": [] },
+  "include": ["src"]
+}
