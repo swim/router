@@ -44,15 +44,11 @@ export interface RouterManifest {
 }
 
 /**
- * Package lines a release's recorded build-time versions must fall in. For 0.x versions the minor is
- * the compatibility line (caret semantics); kept equal to package.json's dependency range (tested).
- * Only embedding-classifier is checked: its artifacts carry no format version, so its line is what
- * keeps a classifier scored by the code it was evaluated with. Rule sets, document pipelines, evidence
- * and manifests carry their own format versions, which loading validates.
+ * @deprecated The router no longer checks recorded package versions against version lines: a release
+ * records the versions it was built with, and serving it with compatible library versions is the
+ * deployer's responsibility. Always empty.
  */
-export const COMPATIBLE_PACKAGES: Readonly<Record<string, string>> = Object.freeze({
-  '@liquidau/embedding-classifier': '0.8',
-});
+export const COMPATIBLE_PACKAGES: Readonly<Record<string, string>> = Object.freeze({});
 
 /** Packages every manifest records (provenance), plus text-preprocessing for document releases. */
 const RECORDED_PACKAGES = ['@liquidau/embedding-classifier', '@liquidau/rule-miner', '@liquidau/router'] as const;
@@ -70,15 +66,9 @@ export function isSafeKey(key: unknown): key is string {
 
 const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
-/** Why a recorded build-time package version is incompatible with this router, or null. */
+/** Why a recorded build-time package version is unusable (not an exact version), or null. */
 export function packageProblem(name: string, version: string): string | null {
-  const line = COMPATIBLE_PACKAGES[name];
-  const m = SEMVER.exec(version);
-  if (!m) return `${name}: '${version}' is not an exact version`;
-  if (line === undefined) return null;
-  const [major, minor] = line.split('.').map(Number);
-  const ok = major === 0 ? Number(m[1]) === 0 && Number(m[2]) === minor : Number(m[1]) === major;
-  return ok ? null : `${name} ${version} is outside the supported ${line}.x line`;
+  return SEMVER.test(version) ? null : `${name}: '${version}' is not an exact version`;
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -134,6 +124,6 @@ export function validateManifest(raw: unknown): RouterManifest {
   const pk: string[] = [];
   for (const name of requiredPackages(raw.schema as RouterManifest['schema'])) if (packages[name] === undefined) pk.push(`${name}: build-time version not recorded`);
   for (const [name, version] of Object.entries(packages)) { const why = packageProblem(name, version); if (why) pk.push(why); }
-  if (pk.length) throw new RouterLoadError('PACKAGE_INCOMPATIBLE', 'the release was built with incompatible packages', pk);
+  if (pk.length) throw new RouterLoadError('PACKAGE_INCOMPATIBLE', 'the release does not record its build-time package versions exactly', pk);
   return raw as unknown as RouterManifest;
 }

@@ -43,12 +43,6 @@ function resolveDir(from: string, name: string): string {
   }
 }
 
-test('COMPATIBLE_PACKAGES matches package.json ranges', () => {
-  const p = pkg(root);
-  assert.deepEqual(Object.keys(COMPATIBLE_PACKAGES), ['@liquidau/embedding-classifier'], 'only the classifier, whose artifacts have no format version, is gated by line');
-  for (const [name, line] of Object.entries(COMPATIBLE_PACKAGES)) {
-    const range = p.dependencies![name];
-    assert.match(range, /^\^0\.\d+\.\d+$/);
-    assert.equal(line, range.slice(1).split('.').slice(0, 2).join('.'));
-  }
+test('recorded package versions are not gated: COMPATIBLE_PACKAGES is empty (deprecated)', () => {
+  assert.deepEqual(COMPATIBLE_PACKAGES, {});
 });

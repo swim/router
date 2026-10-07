@@ -73,9 +73,9 @@ release only after it loads, and keeps the old one if it doesn't.
   them: a final routing evaluation, recorded acceptance criteria, and gates that follow from both.
   Shadow mode accepts failed gates, never invalid or mismatched documents.
 
-Releases record the package versions they were built with. The router reads classifiers built with
-embedding-classifier 0.8.x; rule sets, document pipelines and evidence carry their own format
-versions, which loading checks.
+Releases record the library versions they were built with (pass the installed versions to
+`buildRelease`). The router doesn't check them: serve a release with compatible versions of
+embedding-classifier and rule-miner, ideally the ones it recorded.
 
 ## How a request is decided
 

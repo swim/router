@@ -27,7 +27,11 @@ export interface BuildReleaseInput {
   keys?: Partial<Record<'classifier' | 'rules' | 'policy' | 'evidence', string>>;
   embedding: EncoderIdentity;
   serving: { maxInputUtf8Bytes: number };
-  /** Exact build-time versions of at least the packages requiredPackages lists (embedding-classifier, rule-miner, router; text-preprocessing for document releases). */
+  /**
+   * The exact installed versions the release was built with, recorded for provenance: at least the
+   * packages requiredPackages lists (embedding-classifier, rule-miner, router; text-preprocessing for
+   * document releases). The router doesn't check them; serve with the versions recorded here.
+   */
   packages: Record<string, string>;
 }
 

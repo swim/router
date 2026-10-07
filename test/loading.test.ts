@@ -86,15 +86,14 @@ test('keys may not escape the release prefix', async () => {
   }
 });
 
-test('package versions must be recorded and compatible', async () => {
-  await rejects(loadRouter(await withManifest((m) => { (m.packages as Record<string, string>)['@liquidau/embedding-classifier'] = '0.6.2'; })), 'PACKAGE_INCOMPATIBLE', /0\.8\.x/);
+test('package versions must be recorded as exact versions', async () => {
   await rejects(loadRouter(await withManifest((m) => { delete (m.packages as Record<string, string>)['@liquidau/rule-miner']; })), 'PACKAGE_INCOMPATIBLE', /not recorded/);
   await rejects(loadRouter(await withManifest((m) => { (m.packages as Record<string, string>)['@liquidau/rule-miner'] = 'latest'; })), 'PACKAGE_INCOMPATIBLE', /not an exact version/);
 });
 
-test('releases built with any router or rule-miner version load: their documents carry their own formats', async () => {
+test('releases load whatever library versions they recorded: compatibility is the deployer\'s responsibility', async () => {
   const own = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'package.json'), 'utf8')).version as string;
-  for (const [name, version] of [['@liquidau/router', own], ['@liquidau/router', '0.1.0'], ['@liquidau/router', '1.4.0'], ['@liquidau/rule-miner', '0.6.0'], ['@liquidau/text-preprocessing', '0.3.0']]) {
+  for (const [name, version] of [['@liquidau/router', own], ['@liquidau/router', '0.1.0'], ['@liquidau/router', '1.4.0'], ['@liquidau/rule-miner', '0.6.0'], ['@liquidau/text-preprocessing', '0.3.0'], ['@liquidau/embedding-classifier', '0.6.2'], ['@liquidau/embedding-classifier', '0.9.0']]) {
     const router = await loadRouter(await withManifest((m) => { (m.packages as Record<string, string>)[name] = version; }));
     assert.equal(router.releaseId, 'release-1', `${name} ${version}`);
   }
