@@ -9,6 +9,8 @@
 
 export const RUNTIME_ERROR_CODES = [
   'INVALID_INPUT', 'ENCODER_TIMEOUT', 'ENCODER_FAILURE', 'INVALID_EMBEDDING', 'INVALID_SCORE', 'ABORTED', 'CLOSED',
+  // Split deployments only: a forwarded request names another release than this tier serves.
+  'RELEASE_MISMATCH',
   // Document releases ('liquidau-router/2') only:
   'PREPROCESSING_FAILURE', 'INPUT_LIMIT_EXCEEDED', 'PROCESSING_TIMEOUT',
 ] as const;
@@ -23,6 +25,8 @@ export const RETRYABLE: Readonly<Record<RuntimeErrorCode, boolean>> = Object.fre
   INVALID_SCORE: false,
   ABORTED: false,
   CLOSED: true,
+  /** The tiers serve different releases, e.g. mid-rollout: retry once both run the same manifest. */
+  RELEASE_MISMATCH: true,
   /** The tokenizer adapter failed: deterministic and I/O-free by contract, so not retryable unchanged. */
   PREPROCESSING_FAILURE: false,
   /** The document exceeds a release or host limit (bytes, chunks, planning steps, token budget). */

@@ -1,11 +1,14 @@
 export { loadRouter } from './router.ts';
-export type { LoadRouterOptions, RouteRequest, RouteResult, Router, RouterMode } from './router.ts';
+export type { ForwardedRequest, LoadRouterOptions, RouteRequest, RouteResult, Router, RouterMode } from './router.ts';
+export { loadRulesTier } from './rules-tier.ts';
+export type { LoadRulesTierOptions, RulesTier, RulesTierOutcome } from './rules-tier.ts';
+export { FORWARD_SCHEMA, forwardProblem } from './serving.ts';
 export { RouterSlot } from './slot.ts';
 export type { ReloadOutcome } from './slot.ts';
 export { EncoderError, LOAD_ERROR_CODES, RETRYABLE, RouterLoadError, RUNTIME_ERROR_CODES } from './errors.ts';
 export type { LoadErrorCode, RuntimeErrorCode } from './errors.ts';
-export { createDecisionEvaluator, ScoreError } from './decision.ts';
-export type { AbstainReason, Candidate, DecisionEvaluator, DecisionModel, HeadProjection, ReviewReason, RuleFindings } from './decision.ts';
+export { createDecisionEvaluator, createSettler, ScoreError } from './decision.ts';
+export type { AbstainReason, Candidate, DecisionEvaluator, DecisionModel, HeadProjection, ReviewReason, RuleFindings, Settler } from './decision.ts';
 export { classifierEmbeddingDiff, embeddingCacheKey, ENCODER_IDENTITY_SCHEMA, encoderIdentityDiff, encoderIdentityDigest, encoderIdentityProblems, vectorProblems } from './identity.ts';
 export type { Encoder, EncoderIdentity } from './identity.ts';
 export { COMPATIBLE_PACKAGES, isSafeKey, MANIFEST_SCHEMA, MANIFEST_SCHEMA_DOCUMENT, requiredPackages, validateManifest } from './manifest.ts';

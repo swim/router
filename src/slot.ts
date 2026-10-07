@@ -5,7 +5,7 @@
  * release. A failed reload keeps the previous healthy router. Rollback is a reload of an earlier
  * pinned release.
  */
-import type { RouteRequest, RouteResult, Router } from './router.ts';
+import type { ForwardedRequest, RouteRequest, RouteResult, Router } from './router.ts';
 
 export type ReloadOutcome = { ok: true; releaseId: string; previousReleaseId: string } | { ok: false; releaseId: string; error: unknown };
 
@@ -32,6 +32,11 @@ export class RouterSlot {
   /** After close() has begun, the current router answers CLOSED: no request is actionable. */
   route(request: RouteRequest): Promise<RouteResult> {
     return this.#current.route(request);
+  }
+
+  /** A split deployment's model tier behind a slot: forwards from a rules tier on another release get RELEASE_MISMATCH. */
+  routeForwarded(forward: ForwardedRequest, options?: { signal?: AbortSignal }): Promise<RouteResult | null> {
+    return this.#current.routeForwarded(forward, options);
   }
 
   /**

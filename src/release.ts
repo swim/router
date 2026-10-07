@@ -188,3 +188,72 @@ export function enforcementProblems(docs: ReleaseDocuments): string[] {
   out.push(...evidenceInsufficiency(docs.evidence));
   return out;
 }
+
+/** What a rules tier loads: everything but the classifier, each file verified against the pinned manifest. */
+export interface RulesReleaseDocuments {
+  manifest: RouterManifest;
+  manifestSha256: string;
+  ruleSet: RuleSet;
+  policy: RouterPolicy;
+  evidence: ReleaseEvidence;
+}
+
+/**
+ * Steps 1-6 for a rules tier: the manifest's exact bytes, then the rules, policy and evidence (never the
+ * classifier, so loading stays small and fast), each checked against the manifest's digests; the rule
+ * set's semantic hash; the policy against the rule labels; and the evidence's inputs against the
+ * manifest. The model tier loads the same manifest digest and validates the classifier and its pairing,
+ * so a deployment that pins one digest for both tiers serves one matched release.
+ */
+export async function readRulesRelease(source: ReleaseSource, manifestKey: string, expectedManifestSha256: string, timeoutMs: number, limits: Required<ReadLimits>, signal?: AbortSignal): Promise<RulesReleaseDocuments> {
+  if (!isSha256Hex(expectedManifestSha256)) throw new RouterLoadError('OPTIONS_INVALID', 'expectedManifestSha256 must be lowercase hex SHA-256');
+  const manifestBytes = await readBytes(source, manifestKey, limits.maxManifestBytes, timeoutMs, signal);
+  const manifestSha256 = await sha256Hex(manifestBytes);
+  if (manifestSha256 !== expectedManifestSha256) throw new RouterLoadError('MANIFEST_DIGEST_MISMATCH', `the manifest's SHA-256 is ${manifestSha256}, deployment expects ${expectedManifestSha256}`);
+  const manifest = validateManifest(parse(manifestBytes, 'manifest'));
+  const roles = ['rules', 'policy', 'evidence'] as const;
+  const bytes = await Promise.all(roles.map((role) => readBytes(source, manifest.files[role].key, limits.maxFileBytes, timeoutMs, signal)));
+  const mismatched: string[] = [];
+  for (const [i, role] of roles.entries()) {
+    const actual = await sha256Hex(bytes[i]);
+    if (actual !== manifest.files[role].sha256) mismatched.push(`${role} (${manifest.files[role].key}) has SHA-256 ${actual}, the manifest says ${manifest.files[role].sha256}`);
+  }
+  if (mismatched.length) throw new RouterLoadError('FILE_DIGEST_MISMATCH', 'release files do not match the manifest', mismatched);
+  let ruleSet: RuleSet;
+  try {
+    ruleSet = validateRuleSet(parse(bytes[0], 'rule set'));
+  } catch (e) {
+    if (e instanceof RouterLoadError) throw e;
+    throw new RouterLoadError('RULES_INVALID', 'the rule set is invalid', [(e as Error).message]);
+  }
+  const policy = validatePolicy(parse(bytes[1], 'policy'), { ruleLabels: ruleSet.rules.map((r) => r.label) });
+  const evidence = validateEvidence(parse(bytes[2], 'evidence'));
+  const documentRelease = manifest.schema === MANIFEST_SCHEMA_DOCUMENT;
+  const expectedEvidence = documentRelease ? EVIDENCE_SCHEMA_DOCUMENT : EVIDENCE_SCHEMA;
+  if (evidence.schema !== expectedEvidence) throw new RouterLoadError('UNSUPPORTED_SCHEMA', `a ${manifest.schema} release needs '${expectedEvidence}' evidence, not '${evidence.schema}'`);
+  const semantic = ruleSetHash(ruleSet);
+  const pairing: string[] = [];
+  if (semantic !== manifest.rulesSemanticHash) pairing.push(`the rule set's semantic hash is ${semantic}, the manifest says ${manifest.rulesSemanticHash}`);
+  const ins = evidence.inputs;
+  if (ins.classifierSha256 !== manifest.files.classifier.sha256) pairing.push('the evidence evaluated a different classifier artifact');
+  if (ins.rulesSha256 !== manifest.files.rules.sha256) pairing.push('the evidence evaluated a different rule set file');
+  if (ins.policySha256 !== manifest.files.policy.sha256) pairing.push('the evidence evaluated a different policy');
+  if (ins.rulesSemanticHash !== semantic) pairing.push('the evidence evaluated a different rule set');
+  if (documentRelease) {
+    if (ins.featureIdentitySha256 !== manifest.featureIdentitySha256) pairing.push('the evidence evaluated another document feature identity (encoder or pipeline)');
+    if (ins.servingMaxInputUtf8Bytes !== manifest.serving.maxInputUtf8Bytes) pairing.push(`the evidence was evaluated with a ${ins.servingMaxInputUtf8Bytes}-byte input limit, the manifest serves ${manifest.serving.maxInputUtf8Bytes}`);
+  }
+  if (pairing.length) throw new RouterLoadError('PAIRING_MISMATCH', 'the release documents are not a matched set', pairing);
+  return { manifest, manifestSha256, ruleSet, policy, evidence };
+}
+
+/**
+ * Step 8 for a rules tier. The manifest's gates are the classifier's gates combined with the evidence's
+ * (the builder writes them so and the model tier checks it), so they stand in for the classifier here.
+ */
+export function rulesEnforcementProblems(docs: RulesReleaseDocuments): string[] {
+  const out: string[] = [];
+  if (!docs.manifest.gates.passed || docs.manifest.gates.failures.length) out.push(`complete-release gates did not pass: ${docs.manifest.gates.failures.join('; ')}`);
+  out.push(...evidenceInsufficiency(docs.evidence));
+  return out;
+}

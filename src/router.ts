@@ -15,15 +15,19 @@
 import { DocumentError, prepareScoring, scoreDocument, scoreEmbedding, type ClassifierArtifact, type DocumentAdapters, type DocumentClassifierArtifact, type Scores } from '@liquidau/embedding-classifier';
 import { ruleSetMatcher } from '@liquidau/rule-miner';
 
-import { canonicalJson, deepFreeze, isTimerMs, MAX_TIMER_MS, now, platformProblems, sha256Hex, unitFromDigest, utf8, utf8Length } from './bytes.ts';
-import { createDecisionEvaluator, ScoreError, type AbstainReason, type Candidate, type DecisionEvaluator, type ReviewReason, type RuleFindings } from './decision.ts';
+import { canonicalJson, deepFreeze, isTimerMs, MAX_TIMER_MS, now, platformProblems } from './bytes.ts';
+import { createDecisionEvaluator, ScoreError, type Candidate, type DecisionEvaluator, type RuleFindings } from './decision.ts';
 import { EncoderError, RETRYABLE, RouterLoadError, type RuntimeErrorCode } from './errors.ts';
-import { deliver, type DecisionEvent, type DocumentTelemetry, type RouterEvent, type TelemetryCounters } from './events.ts';
+import type { DecisionEvent, DocumentTelemetry, RouterEvent, TelemetryCounters } from './events.ts';
 import { encoderIdentityDiff, encoderIdentityProblems, vectorProblems, type Encoder, type EncoderIdentity } from './identity.ts';
 import type { RouterManifest } from './manifest.ts';
 import { DEFAULT_LIMITS, enforcementProblems, readRelease, type ReadLimits, type ReleaseSource } from './release.ts';
+import {
+  Background, decisionEvent, Drain, forwardProblem, requestIdOf, requestProblem, selectedForMonitoring, unavailableEvent, unavailableResult, wrapCandidate,
+  type EventContext, type ForwardedRequest, type RouteRequest, type RouteResult, type RouterMode,
+} from './serving.ts';
 
-export type RouterMode = 'enforce' | 'shadow';
+export type { ForwardedRequest, RouteRequest, RouteResult, RouterMode };
 
 export interface LoadRouterOptions {
   source: ReleaseSource;
@@ -64,31 +68,18 @@ export interface LoadRouterOptions {
   document?: { batchSize?: number; concurrency?: number; yieldEvery?: number };
 }
 
-export interface RouteRequest {
-  text: string;
-  requestId: string;
-  signal?: AbortSignal;
-}
-
-interface ResultBase {
-  releaseId: string;
-  requestId: string;
-  embedded: boolean;
-}
-
-export type RouteResult = ResultBase & (
-  | { mode: 'enforce'; actionable: true; outcome: 'route'; routeId: string; destination: string; mechanism: 'rule' | 'classifier' }
-  | { mode: 'enforce'; actionable: false; outcome: 'review'; reason: ReviewReason }
-  | { mode: 'enforce'; actionable: false; outcome: 'abstain'; reason: AbstainReason }
-  | { mode: 'shadow'; actionable: false; outcome: 'shadow'; candidate: Candidate }
-  | { mode: RouterMode; actionable: false; outcome: 'unavailable'; code: RuntimeErrorCode; retryable: boolean }
-);
-
 export interface Router {
   readonly releaseId: string;
   readonly manifestSha256: string;
   readonly mode: RouterMode;
   route(request: RouteRequest): Promise<RouteResult>;
+  /**
+   * The model tier of a split deployment (see loadRulesTier): a request its rules tier forwarded.
+   * 'decide' is routed exactly as route() would; 'monitor' (a request the rules tier answered and
+   * selected) is embedded and scored for telemetry only, in the background, and resolves to null. A
+   * request forwarded by a tier serving another release is refused (RELEASE_MISMATCH).
+   */
+  routeForwarded(forward: ForwardedRequest, options?: { signal?: AbortSignal }): Promise<RouteResult | null>;
   /**
    * Resolves once background work started so far has finished: monitoring embeddings and observer
    * deliveries, which run after `route()` returns. Function hosts await it before the invocation ends
@@ -184,14 +175,16 @@ export async function loadRouter(options: LoadRouterOptions): Promise<Router> {
     if (why.length) throw new RouterLoadError('GATES_FAILED', 'refusing to enforce this release (it may be served in shadow mode)', why);
   }
 
-  // Step 9: freeze the snapshot we parsed ourselves, compile rules, initialise reference state.
+  // Step 9: initialise reference state, then freeze the snapshot we parsed ourselves and compile rules.
+  // Preparing first matters: a knn or stack head's reference projection reads the artifact's arrays,
+  // which are several times slower to read once frozen (seconds of cold start on a large reference).
+  prepareScoring(docs.artifact);
   const artifact = deepFreeze(docs.artifact);
   const ruleSet = deepFreeze(docs.ruleSet);
   const policy = deepFreeze(docs.policy);
   deepFreeze(docs.evidence);
   const manifest = deepFreeze(docs.manifest);
   const document = docs.document ? deepFreeze(docs.document) : null;
-  prepareScoring(artifact);
   const evaluator = createDecisionEvaluator(
     { heads: Object.fromEntries(Object.entries(artifact.heads).map(([h, s]) => [h, { threshold: s!.threshold, reviewFloor: s!.review_floor }])) },
     policy,
@@ -220,17 +213,12 @@ class LoadedRouter implements Router {
   readonly #sampleRate: number;
   readonly #salt: string;
   readonly #monitorTimeoutMs: number;
-  readonly #observer: LoadRouterOptions['observer'];
-  readonly #observerTimeoutMs: number;
   readonly #tokenizer: LoadRouterOptions['tokenizer'];
   readonly #boundary: { boundaryEncoder: Encoder; boundaryTokenizer: NonNullable<LoadRouterOptions['tokenizer']> } | null;
   readonly #documentOptions: { batchSize?: number; concurrency?: number; yieldEvery?: number };
-  readonly #counters: TelemetryCounters = { delivered: 0, dropped: 0 };
-  /** Monitoring embeddings and observer deliveries still running after their request returned. */
-  readonly #background = new Set<Promise<void>>();
-  #closed = false;
-  #inflight = 0;
-  #drained: (() => void) | null = null;
+  /** Observer deliveries and monitoring embeddings that run after a result is returned. */
+  readonly #bg: Background;
+  readonly #drain = new Drain();
   #closing: Promise<void> | null = null;
 
   constructor(snapshot: Snapshot, o: LoadRouterOptions) {
@@ -243,75 +231,71 @@ class LoadedRouter implements Router {
     this.#sampleRate = o.monitoring.sampleRate;
     this.#salt = o.monitoring.samplingSalt;
     this.#monitorTimeoutMs = o.monitoring.timeoutMs ?? o.timeoutMs;
-    this.#observer = o.observer;
-    this.#observerTimeoutMs = o.observerTimeoutMs ?? 250;
+    this.#bg = new Background(o.observer, o.observerTimeoutMs ?? 250);
     this.#tokenizer = o.tokenizer;
     this.#boundary = o.boundaryEncoder && o.boundaryTokenizer ? { boundaryEncoder: o.boundaryEncoder, boundaryTokenizer: o.boundaryTokenizer } : null;
     this.#documentOptions = { ...o.document };
   }
 
   telemetry(): TelemetryCounters {
-    return { ...this.#counters };
+    return this.#bg.telemetry();
   }
 
-  async flush(): Promise<void> {
-    // Settling work can start more (a monitoring sample emits its event), so repeat until none is left.
-    while (this.#background.size) await Promise.all(this.#background);
+  flush(): Promise<void> {
+    return this.#bg.flush();
   }
 
   close(): Promise<void> {
-    this.#closed = true;
     this.#closing ??= (async () => {
-      if (this.#inflight > 0) await new Promise<void>((resolve) => { this.#drained = resolve; });
-      await this.flush();
+      await this.#drain.close();
+      await this.#bg.flush();
     })();
     return this.#closing;
   }
 
-  /** Runs `work` after the response; it must not reject (it is tracked for flush and close). */
-  #inBackground(work: Promise<void>): void {
-    const tracked = work.catch(() => {}).finally(() => { this.#background.delete(tracked); });
-    this.#background.add(tracked);
+  #base(requestId: string, samplingProbability = this.#sampleRate): EventContext {
+    return { releaseId: this.releaseId, requestId, mode: this.mode, samplingProbability };
+  }
+
+  /** Refusals are visible in telemetry too, e.g. while a slot drains this router during a swap. */
+  #refuse(requestId: string, code: RuntimeErrorCode): RouteResult {
+    this.#bg.emit(unavailableEvent(this.#base(requestId), code, 0));
+    return unavailableResult(this.mode, this.releaseId, requestId, code, false);
   }
 
   async route(request: RouteRequest): Promise<RouteResult> {
-    const requestId = typeof request?.requestId === 'string' ? request.requestId : String(request?.requestId ?? '');
-    if (this.#closed) {
-      // Refusals are visible in telemetry too, e.g. while a slot drains this router during a swap.
-      this.#emit({
-        releaseId: this.releaseId, requestId, mode: this.mode, samplingProbability: this.#sampleRate, type: 'decision', outcome: 'unavailable', routeId: null, mechanism: null,
-        reason: null, rulesSettled: false, sampled: false, embedded: false, inclusionProbability: 1, firedRule: null, dismissed: [], errorCode: 'CLOSED',
-        timings: { totalMs: 0, rulesMs: 0, embedMs: null, scoreMs: null },
-      });
-      return this.#unavailable(requestId, 'CLOSED', false);
+    const requestId = requestIdOf(request);
+    if (this.#drain.closed) return this.#refuse(requestId, 'CLOSED');
+    return this.#drain.track(() => this.#route(request, requestId));
+  }
+
+  async routeForwarded(forward: ForwardedRequest, options: { signal?: AbortSignal } = {}): Promise<RouteResult | null> {
+    const why = forwardProblem(forward);
+    const requestId = typeof forward?.requestId === 'string' ? forward.requestId : '';
+    if (why) return this.#refuse(requestId, 'INVALID_INPUT');
+    if (forward.manifestSha256 !== this.manifestSha256) return this.#refuse(requestId, 'RELEASE_MISMATCH');
+    if (forward.purpose === 'decide') return this.route({ text: forward.text, requestId, ...(options.signal ? { signal: options.signal } : {}) });
+    if (this.#drain.closed) return this.#refuse(requestId, 'CLOSED');
+    // Telemetry only: the rules tier has already answered this request.
+    if (requestProblem({ text: forward.text, requestId }, requestId, this.#s.manifest, this.#s.document ? null : this.#s.identity) === null) {
+      this.#bg.run(this.#monitor(forward.text, this.#base(requestId, forward.inclusionProbability), forward.inclusionProbability));
     }
-    this.#inflight++;
-    try {
-      return await this.#route(request, requestId);
-    } finally {
-      if (--this.#inflight === 0 && this.#drained) this.#drained();
-    }
+    return null;
   }
 
   async #route(request: RouteRequest, requestId: string): Promise<RouteResult> {
     const t0 = now();
     const s = this.#s;
-    const base = { releaseId: this.releaseId, requestId, mode: this.mode, samplingProbability: this.#sampleRate };
+    const base = this.#base(requestId);
     const fail = (code: RuntimeErrorCode, extra: Partial<DecisionEvent> = {}, retryable = RETRYABLE[code]): RouteResult => {
-      this.#emit({
-        ...base, type: 'decision', outcome: 'unavailable', routeId: null, mechanism: null, reason: null, rulesSettled: false, sampled: false, embedded: false,
-        inclusionProbability: 1, firedRule: null, dismissed: [], errorCode: code, timings: { totalMs: now() - t0, rulesMs: 0, embedMs: null, scoreMs: null }, ...extra,
-      });
-      return this.#unavailable(requestId, code, false, retryable);
+      this.#bg.emit(unavailableEvent(base, code, now() - t0, extra));
+      return unavailableResult(this.mode, this.releaseId, requestId, code, false, retryable);
     };
 
     // 1. Input and cancellation.
-    const text = request?.text;
-    if (typeof text !== 'string' || !requestId || requestId.length > 256) return fail('INVALID_INPUT');
-    if (utf8Length(text) > s.manifest.serving.maxInputUtf8Bytes) return fail('INVALID_INPUT');
-    // Legacy releases embed the whole text once; a document release applies maxChars per chunk instead.
-    if (!s.document && s.identity.truncation === 'none' && s.identity.maxChars !== null && text.length > s.identity.maxChars) return fail('INVALID_INPUT');
-    if (request.signal?.aborted) return fail('ABORTED');
+    const problem = requestProblem(request, requestId, s.manifest, s.document ? null : s.identity);
+    if (problem) return fail(problem);
+    const text = request.text;
 
     // 2-3. Rules on the original text; conservative settlement.
     const tr = now();
@@ -322,11 +306,11 @@ class LoadedRouter implements Router {
     const ruleFields = { firedRule: rules.fired?.id ?? null, dismissed: rules.dismissed };
 
     if (settled) {
-      const sampled = await this.#selected(requestId);
-      this.#emitDecision(base, settled, { ...ruleFields, rulesSettled: true, sampled, embedded: false, inclusionProbability: this.#sampleRate, errorCode: null, timings: { totalMs: now() - t0, rulesMs, embedMs: null, scoreMs: null } });
+      const sampled = await selectedForMonitoring(this.releaseId, this.#salt, this.#sampleRate, requestId);
+      this.#bg.emit(decisionEvent(base, settled, { ...ruleFields, rulesSettled: true, sampled, embedded: false, inclusionProbability: this.#sampleRate, errorCode: null, timings: { totalMs: now() - t0, rulesMs, embedMs: null, scoreMs: null } }));
       // The decision doesn't need the embedding, so the response doesn't wait for it.
-      if (sampled) this.#inBackground(this.#monitor(text, base));
-      return this.#wrap(requestId, settled, false);
+      if (sampled) this.#bg.run(this.#monitor(text, base, this.#sampleRate));
+      return wrapCandidate(this.mode, this.releaseId, requestId, settled, false);
     }
 
     // 4. Embed and score within the deadline.
@@ -345,27 +329,19 @@ class LoadedRouter implements Router {
       if (!(e instanceof ScoreError)) throw e;
       return fail('INVALID_SCORE', { ...ruleFields, embedded: true, timings: { totalMs: now() - t0, rulesMs, embedMs: scored.embedMs, scoreMs: scored.scoreMs } });
     }
-    this.#emitDecision(base, candidate, {
+    this.#bg.emit(decisionEvent(base, candidate, {
       ...ruleFields, rulesSettled: false, sampled: false, embedded: true, inclusionProbability: 1, errorCode: null,
       timings: { totalMs: now() - t0, rulesMs, embedMs: scored.embedMs, scoreMs: scored.scoreMs }, calibratedProbabilities: Object.freeze({ ...scored.scores }) as Record<string, number>,
       ...(scored.document ? { document: scored.document } : {}),
-    });
-    return this.#wrap(requestId, candidate, true);
-  }
-
-  /** Deterministic selection by release, salt and request id (never by text alone). */
-  async #selected(requestId: string): Promise<boolean> {
-    if (this.#sampleRate <= 0) return false;
-    if (this.#sampleRate >= 1) return true;
-    const digest = await sha256Hex(utf8(canonicalJson(['liquidau-router-sample/1', this.releaseId, this.#salt, requestId])));
-    return unitFromDigest(digest) < this.#sampleRate;
+    }));
+    return wrapCandidate(this.mode, this.releaseId, requestId, candidate, true);
   }
 
   /**
    * Embeds a settled request for monitoring, after its result was returned, so the request's signal no
    * longer applies: monitoring.timeoutMs bounds it. Reports and swallows every failure.
    */
-  async #monitor(text: string, base: { releaseId: string; requestId: string; mode: RouterMode; samplingProbability: number }): Promise<void> {
+  async #monitor(text: string, base: EventContext, inclusionProbability: number): Promise<void> {
     const t = now();
     try {
       const { scores, embedMs, scoreMs, document } = await this.#embedAndScore(text, undefined, this.#monitorTimeoutMs);
@@ -377,10 +353,10 @@ class LoadedRouter implements Router {
         if (!(e instanceof ScoreError)) throw e;
         throw new RuntimeFailure('INVALID_SCORE');
       }
-      this.#emit({ ...base, type: 'diagnostic', kind: 'monitoring_sample', inclusionProbability: this.#sampleRate, classifierCandidate, calibratedProbabilities: Object.freeze({ ...scores }) as Record<string, number>, timings: { embedMs, scoreMs }, ...(document ? { document } : {}) });
+      this.#bg.emit({ ...base, type: 'diagnostic', kind: 'monitoring_sample', inclusionProbability, classifierCandidate, calibratedProbabilities: Object.freeze({ ...scores }) as Record<string, number>, timings: { embedMs, scoreMs }, ...(document ? { document } : {}) });
     } catch (e) {
       const code = e instanceof RuntimeFailure ? e.code : 'ENCODER_FAILURE';
-      this.#emit({ ...base, type: 'monitoring_error', code, timings: { embedMs: now() - t } });
+      this.#bg.emit({ ...base, type: 'monitoring_error', code, timings: { embedMs: now() - t } });
     }
   }
 
@@ -485,33 +461,5 @@ class LoadedRouter implements Router {
     if (!Array.isArray(rows) || rows.length !== 1) throw new RuntimeFailure('INVALID_EMBEDDING');
     if (vectorProblems(this.#s.identity, rows[0]) !== null) throw new RuntimeFailure('INVALID_EMBEDDING');
     return rows[0] as readonly number[];
-  }
-
-  #wrap(requestId: string, c: Candidate, embedded: boolean): RouteResult {
-    const base = { releaseId: this.releaseId, requestId, embedded };
-    if (this.mode === 'shadow') return { ...base, mode: 'shadow', actionable: false, outcome: 'shadow', candidate: { ...c } };
-    if (c.outcome === 'route') return { ...base, mode: 'enforce', actionable: true, outcome: 'route', routeId: c.routeId, destination: c.destination, mechanism: c.mechanism };
-    if (c.outcome === 'review') return { ...base, mode: 'enforce', actionable: false, outcome: 'review', reason: c.reason };
-    return { ...base, mode: 'enforce', actionable: false, outcome: 'abstain', reason: c.reason };
-  }
-
-  #unavailable(requestId: string, code: RuntimeErrorCode, embedded: boolean, retryable = RETRYABLE[code]): RouteResult {
-    return { releaseId: this.releaseId, requestId, embedded, mode: this.mode, actionable: false, outcome: 'unavailable', code, retryable };
-  }
-
-  #emitDecision(base: { releaseId: string; requestId: string; mode: RouterMode; samplingProbability: number }, c: Candidate, rest: Omit<DecisionEvent, 'type' | 'outcome' | 'routeId' | 'mechanism' | 'reason' | keyof typeof base>): void {
-    this.#emit({
-      ...base, type: 'decision', outcome: c.outcome, routeId: c.outcome === 'route' ? c.routeId : null, mechanism: c.outcome === 'route' ? c.mechanism : null,
-      reason: c.outcome === 'route' ? null : c.reason, ...rest,
-    });
-  }
-
-  /** Hands the event to the observer now (in order); waiting for an asynchronous observer happens in the background. */
-  #emit(event: RouterEvent): void {
-    if (!this.#observer) return;
-    this.#inBackground(deliver(this.#observer, event, this.#observerTimeoutMs).then((ok) => {
-      if (ok === true) this.#counters.delivered++;
-      else if (ok === false) this.#counters.dropped++;
-    }));
   }
 }

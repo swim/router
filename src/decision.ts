@@ -62,12 +62,57 @@ export interface DecisionEvaluator {
   decide(rules: RuleFindings, scores: Readonly<Record<string, number | undefined>>): Candidate;
 }
 
+export interface Settler {
+  /** Route ids in priority order. */
+  readonly priority: readonly string[];
+  /** The rules-only decision when it can't depend on any score, else null. Throws on conflicting findings. */
+  settle(rules: RuleFindings): Candidate | null;
+}
+
+/** The policy-only half shared by the settler and the evaluator: label checks, settlement and result shapes. */
+function policyParts(policy: RouterPolicy) {
+  const p = deepFreeze(jsonClone(policy));
+  const classifierPolicy: DecisionPolicy<string> = deepFreeze({ priority: [...p.priority], suppress: p.suppress.map((s) => ({ when: [...s.when], heads: [...s.heads] })) });
+  const destination = new Map(p.routes.map((r) => [r.id, r.destination]));
+  const routes = new Set(p.priority);
+  const check = (rules: RuleFindings) => {
+    if (rules.fired !== null && !routes.has(rules.fired.label)) throw new Error(`rule ${rules.fired.id} fired ${rules.fired.label}, which is not a route`);
+    for (const d of rules.dismissed) if (!routes.has(d)) throw new Error(`dismissed label ${d} is not a route`);
+    if (rules.fired !== null && rules.dismissed.includes(rules.fired.label)) {
+      throw new Error(`conflicting findings: rule ${rules.fired.id} fires ${rules.fired.label}, which is also dismissed (rule-miner's matcher never reports both)`);
+    }
+  };
+  const candidate = (d: Decision<string>, rules: RuleFindings): Candidate => {
+    if (d.head !== null) return { outcome: 'route', routeId: d.head, destination: destination.get(d.head)!, mechanism: d.reason === 'rule' ? 'rule' : 'classifier' };
+    if (d.reason === 'near_threshold') return { outcome: 'review', reason: 'near_threshold' };
+    if (p.onAbstain === 'review') return { outcome: 'review', reason: 'abstention_policy' };
+    const off = new Set(rules.dismissed);
+    return { outcome: 'abstain', reason: p.priority.every((h) => off.has(h)) ? 'all_dismissed' : 'no_match' };
+  };
+  const settle = (rules: RuleFindings) => {
+    check(rules);
+    const s = settleWithRules(classifierPolicy, rules);
+    return s.settled ? candidate(s.decision, rules) : null;
+  };
+  return { p, classifierPolicy, check, candidate, settle };
+}
+
+/**
+ * Settlement alone, from the policy (no classifier): what a rules tier needs. Settlement never reads a
+ * score or threshold, so it equals createDecisionEvaluator(...).settle for the same policy.
+ */
+export function createSettler(policy: RouterPolicy): Settler {
+  const parts = policyParts(policy);
+  validatePolicy(parts.p);
+  return Object.freeze({ priority: parts.p.priority, settle: parts.settle });
+}
+
 /**
  * Builds a frozen evaluator from a head projection and a policy (both copied, then validated: the
  * policy's routes must be exactly the model's heads). Usable offline without a release.
  */
 export function createDecisionEvaluator(model: DecisionModel, policy: RouterPolicy): DecisionEvaluator {
-  const p = deepFreeze(jsonClone(policy));
+  const { p, classifierPolicy, check, candidate, settle } = policyParts(policy);
   validatePolicy(p, { heads: Object.keys(model.heads) });
   const heads: Record<string, { threshold: number; review_floor: number }> = {};
   for (const [h, proj] of Object.entries(model.heads)) {
@@ -78,36 +123,14 @@ export function createDecisionEvaluator(model: DecisionModel, policy: RouterPoli
     heads[h] = { threshold, review_floor: reviewFloor };
   }
   const artifact: DecisionHeads<string> = deepFreeze({ heads });
-  const classifierPolicy: DecisionPolicy<string> = deepFreeze({ priority: [...p.priority], suppress: p.suppress.map((s) => ({ when: [...s.when], heads: [...s.heads] })) });
-  const destination = new Map(p.routes.map((r) => [r.id, r.destination]));
-  const routes = new Set(p.priority);
-
-  const check = (rules: RuleFindings) => {
-    if (rules.fired !== null && !routes.has(rules.fired.label)) throw new Error(`rule ${rules.fired.id} fired ${rules.fired.label}, which is not a route`);
-    for (const d of rules.dismissed) if (!routes.has(d)) throw new Error(`dismissed label ${d} is not a route`);
-    if (rules.fired !== null && rules.dismissed.includes(rules.fired.label)) {
-      throw new Error(`conflicting findings: rule ${rules.fired.id} fires ${rules.fired.label}, which is also dismissed (rule-miner's matcher never reports both)`);
-    }
-  };
   const required = (rules: RuleFindings) => {
     const off = new Set(rules.dismissed);
     return p.priority.filter((h) => !off.has(h) && h !== rules.fired?.label);
   };
-  const candidate = (d: Decision<string>, rules: RuleFindings): Candidate => {
-    if (d.head !== null) return { outcome: 'route', routeId: d.head, destination: destination.get(d.head)!, mechanism: d.reason === 'rule' ? 'rule' : 'classifier' };
-    if (d.reason === 'near_threshold') return { outcome: 'review', reason: 'near_threshold' };
-    if (p.onAbstain === 'review') return { outcome: 'review', reason: 'abstention_policy' };
-    const off = new Set(rules.dismissed);
-    return { outcome: 'abstain', reason: p.priority.every((h) => off.has(h)) ? 'all_dismissed' : 'no_match' };
-  };
 
   return Object.freeze({
     priority: p.priority,
-    settle(rules: RuleFindings) {
-      check(rules);
-      const s = settleWithRules(classifierPolicy, rules);
-      return s.settled ? candidate(s.decision, rules) : null;
-    },
+    settle,
     requiredScores(rules: RuleFindings) {
       check(rules);
       return required(rules);

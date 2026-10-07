@@ -44,7 +44,7 @@ Results are a discriminated union:
 | `{ mode: 'enforce', actionable: false, outcome: 'review', reason }` | `near_threshold` or `abstention_policy` |
 | `{ mode: 'enforce', actionable: false, outcome: 'abstain', reason }` | `no_match` or `all_dismissed` |
 | `{ mode: 'shadow', actionable: false, outcome: 'shadow', candidate }` | What enforce would have decided; never act on it |
-| `{ actionable: false, outcome: 'unavailable', code, retryable }` | `INVALID_INPUT`, `ENCODER_TIMEOUT`, `ENCODER_FAILURE`, `INVALID_EMBEDDING`, `INVALID_SCORE`, `ABORTED`, `CLOSED`. Never a negative label |
+| `{ actionable: false, outcome: 'unavailable', code, retryable }` | `INVALID_INPUT`, `ENCODER_TIMEOUT`, `ENCODER_FAILURE`, `INVALID_EMBEDDING`, `INVALID_SCORE`, `ABORTED`, `CLOSED`, and in a split deployment `RELEASE_MISMATCH`. Never a negative label |
 
 Timeouts must be in [1, 2147483647] ms (longer delays overflow timers). Load failures throw `RouterLoadError` with a stable `code` and `details`. `close()` refuses new
 requests and resolves once in-flight ones and background work finish. Monitoring embeddings and
@@ -54,6 +54,69 @@ hand it to the platform (`ctx.waitUntil`), or that work may be frozen or dropped
 and keeps the old one if the reload fails. `slot.close()` is terminal: later or queued reloads are
 refused, a replacement that finishes loading after close is closed rather than installed, and close
 waits for retired routers to drain.
+
+## Split deployment: a rules tier in front of the model
+
+The deterministic rules can run in their own small function (a Lambda, or an edge Worker) and send
+only the requests they can't settle to the model's function:
+
+```ts
+import { loadRouter, loadRulesTier } from '@liquidau/router';
+
+// Rules function: loads the manifest, rules, policy and evidence - never the classifier - so it
+// starts in milliseconds and needs no encoder.
+const rules = await loadRulesTier({ source, manifestKey, expectedManifestSha256, mode: 'enforce', timeoutMs: 2000,
+  monitoring: { sampleRate: 0.05, samplingSalt } });
+const outcome = await rules.handle({ text, requestId });
+if (outcome.answered) {
+  respond(outcome.result);
+  if (outcome.monitor) await sendToModelTier(outcome.monitor);   // telemetry only, after the answer
+} else {
+  respond(await sendToModelTier(outcome.forward));              // JSON; the model tier decides
+}
+
+// Model function: an ordinary router on the SAME manifest digest.
+const router = await loadRouter({ source, manifestKey, expectedManifestSha256, mode: 'enforce', encoder, timeoutMs: 2000,
+  monitoring: { sampleRate: 0.05, samplingSalt } });
+const result = await router.routeForwarded(forward);            // null for a 'monitor' forward
+await router.flush();
+```
+
+- **Exactly one process's decisions.** Both tiers run the same input checks, rules and settlement
+  code; a `'decide'` forward is routed as `route()` would route it, and the two tiers' telemetry
+  together is what one router emits. Use the same mode and monitoring settings in both.
+- **One release.** Both tiers pin the same manifest digest. A forward carries it, and the model tier
+  answers a forward from another release with `RELEASE_MISMATCH` (retryable: during a rollout, retry
+  once both tiers serve the new release). The rules tier checks every file it reads against the
+  manifest; the model tier validates the classifier and its pairing with the rules.
+- **When it pays.** The rules tier answers only what no score could change: a rule firing the
+  first-priority head that nothing can suppress, or every head dismissed. How much traffic that is
+  depends on the release: measure it on your own traffic (the evaluation evidence reports
+  `rulesSettlementRate`) before splitting.
+- `createSettler(policy)` is the rules tier's settlement on its own, for offline checks.
+
+## Serverless deployment
+
+- **Load once per instance.** Call `loadRouter` (or `loadRulesTier`) at module scope, so a warm
+  instance reuses the validated release; loading reads and hashes every release file and decodes any
+  kNN reference, so it belongs in the cold start, not in a request.
+- **The release.** Bundle the files with the function, or read them from object storage through a
+  `ReleaseSource`; pass the manifest digest from deployment configuration (an environment variable read
+  by the host, never by the router). A new release is a new digest: deploy it, then roll back by
+  redeploying the previous digest. In a long-running process, `RouterSlot.reload` swaps releases
+  without mixing them.
+- **Finish background work.** Monitoring embeddings and observer deliveries run after `route()`
+  returns. Await `router.flush()` before the invocation ends, or hand it to the platform
+  (`ctx.waitUntil(router.flush())` on Workers); a frozen function may otherwise never run them.
+- **Memory.** Size the model function for the encoder's model, the decoded kNN reference of any kNN or
+  stack head (4 bytes per value: rows × dimensions) and the release documents. kNN and stack heads
+  also compare each request with every reference row, so they cost far more per request than linear
+  heads; measure both on your release before choosing a memory size.
+- **Cold starts.** The rules tier has no model, so it starts fast enough for edge runtimes. The model
+  tier's cold start is dominated by loading the encoder's model; keep instances warm (provisioned
+  concurrency) where that latency matters.
+- **Hosted embeddings.** An encoder adapter can call a hosted embedding API instead of a local model;
+  its identity must still match the release exactly (a hosted model can't produce multi-layer features).
 
 ## What loading checks
 
@@ -140,7 +203,7 @@ tenant scope.
 ## Checks
 
 ```sh
-npm test              # unit, equivalence, loading, routing, host-wrapper and packaging tests
+npm test              # unit, equivalence, split-deployment, loading, routing, host-wrapper and packaging tests
 npm run typecheck     # including a no-Node-types pass over src
 npm run check:portable
 ```
