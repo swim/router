@@ -1,6 +1,6 @@
 {
   "name": "@liquidau/router",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "license": "MIT",
   "description": "Validates an immutable classifier + rules + policy + evidence bundle, settles requests with certified rules first, embeds and scores only when needed, and returns enforce or shadow route decisions.",
   "keywords": [
