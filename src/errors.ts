@@ -11,7 +11,8 @@ export const RUNTIME_ERROR_CODES = [
   'INVALID_INPUT', 'ENCODER_TIMEOUT', 'ENCODER_FAILURE', 'INVALID_EMBEDDING', 'INVALID_SCORE', 'ABORTED', 'CLOSED',
   // Split deployments only: a forwarded request names another release than this tier serves.
   'RELEASE_MISMATCH',
-  // Document releases ('liquidau-router/2') only:
+  // Document releases ('liquidau-router/2') only, except PREPROCESSING_FAILURE, which is also the
+  // edge tier failing on a message (e.g. its static encoder throwing):
   'PREPROCESSING_FAILURE', 'INPUT_LIMIT_EXCEEDED', 'PROCESSING_TIMEOUT',
 ] as const;
 export type RuntimeErrorCode = (typeof RUNTIME_ERROR_CODES)[number];
@@ -27,7 +28,7 @@ export const RETRYABLE: Readonly<Record<RuntimeErrorCode, boolean>> = Object.fre
   CLOSED: true,
   /** The tiers serve different releases, e.g. mid-rollout: retry once both run the same manifest. */
   RELEASE_MISMATCH: true,
-  /** The tokenizer adapter failed: deterministic and I/O-free by contract, so not retryable unchanged. */
+  /** The tokenizer adapter, or the edge tier, failed: deterministic and I/O-free by contract, so not retryable unchanged. */
   PREPROCESSING_FAILURE: false,
   /** The document exceeds a release or host limit (bytes, chunks, planning steps, token budget). */
   INPUT_LIMIT_EXCEEDED: false,
@@ -61,6 +62,11 @@ export const LOAD_ERROR_CODES = [
   'CAPABILITY_MISSING',
   /** The tokenizer adapter doesn't implement the release pipeline's tokenizer identity. */
   'TOKENIZER_MISMATCH',
+  /** The release's edge document is invalid. */
+  'EDGE_INVALID',
+  'MIDDLE_INVALID',
+  /** The host's static encoder isn't the one the edge was trained with (or is missing). */
+  'STATIC_ENCODER_MISMATCH',
 ] as const;
 export type LoadErrorCode = (typeof LOAD_ERROR_CODES)[number];
 

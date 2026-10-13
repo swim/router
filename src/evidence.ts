@@ -37,7 +37,8 @@ export interface EvidenceClaim {
 export interface ReleaseEvidence {
   schema: typeof EVIDENCE_SCHEMA | typeof EVIDENCE_SCHEMA_DOCUMENT;
   /** Digests of exactly what was evaluated ('/2' adds the feature identity and serving input limit). */
-  inputs: { classifierSha256: string; rulesSha256: string; policySha256: string; rulesSemanticHash: string; featureIdentitySha256?: string; servingMaxInputUtf8Bytes?: number };
+  /** `edgeSha256` / `middleSha256`: the exact edge and middle files' SHA-256, when the evaluated system had those tiers. */
+  inputs: { classifierSha256: string; rulesSha256: string; policySha256: string; rulesSemanticHash: string; featureIdentitySha256?: string; servingMaxInputUtf8Bytes?: number; edgeSha256?: string; middleSha256?: string };
   datasets: Array<{ id: string; split: string; items: number; description?: string }>;
   /** The dataset `final` was measured on; its `items` must equal the report's. Required with `final`. */
   finalDataset?: string;
@@ -67,7 +68,10 @@ export function validateEvidence(raw: unknown): ReleaseEvidence {
   if (!isObject(inputs)) p.push('inputs must be an object');
   else {
     const hashes = ['classifierSha256', 'rulesSha256', 'policySha256', 'rulesSemanticHash', ...(documentEvidence ? ['featureIdentitySha256'] : [])];
-    for (const k of Object.keys(inputs)) if (![...hashes, ...(documentEvidence ? ['servingMaxInputUtf8Bytes'] : [])].includes(k)) p.push(`inputs has unknown field ${k}`);
+    for (const k of Object.keys(inputs)) if (![...hashes, 'edgeSha256', ...(documentEvidence ? ['servingMaxInputUtf8Bytes'] : ['middleSha256'])].includes(k)) p.push(`inputs has unknown field ${k}`);
+    if (inputs.edgeSha256 !== undefined && !isSha256Hex(inputs.edgeSha256)) p.push('inputs.edgeSha256 must be lowercase hex SHA-256');
+    if (inputs.middleSha256 !== undefined && !isSha256Hex(inputs.middleSha256)) p.push('inputs.middleSha256 must be lowercase hex SHA-256');
+    if (inputs.middleSha256 !== undefined && inputs.edgeSha256 === undefined) p.push('inputs.middleSha256 needs inputs.edgeSha256 (the middle tier sits behind the edge)');
     for (const k of hashes) if (!isSha256Hex(inputs[k])) p.push(`inputs.${k} must be lowercase hex SHA-256`);
     if (documentEvidence && !(Number.isInteger(inputs.servingMaxInputUtf8Bytes) && (inputs.servingMaxInputUtf8Bytes as number) >= 1)) p.push('inputs.servingMaxInputUtf8Bytes must be a positive integer');
   }
@@ -148,8 +152,9 @@ function finalReportProblems(f: unknown, datasetItems: number | undefined): stri
   p.push(...rateProblems(f.falseRouteRate, 'final.falseRouteRate'));
   p.push(...rateProblems(f.ruleFiringRate, 'final.ruleFiringRate', { of: items }));
   p.push(...rateProblems(f.rulesSettlementRate, 'final.rulesSettlementRate', { of: items }));
+  if (f.middleSettlementRate !== undefined) p.push(...rateProblems(f.middleSettlementRate, 'final.middleSettlementRate', { of: items }));
   const m = f.mechanism;
-  if (!isObject(m) || !count(m.rule) || !count(m.classifier) || (m.rule as number) + (m.classifier as number) !== routed) p.push(`final.mechanism must split the ${routed} routed items into rule and classifier counts`);
+  if (!isObject(m) || !count(m.rule) || !count(m.classifier) || (m.edge !== undefined && !count(m.edge)) || (m.middle !== undefined && !count(m.middle)) || Object.keys(m).some((k) => !['rule', 'classifier', 'edge', 'middle'].includes(k)) || (m.rule as number) + (m.classifier as number) + ((m.edge as number | undefined) ?? 0) + ((m.middle as number | undefined) ?? 0) !== routed) p.push(`final.mechanism must split the ${routed} routed items into rule, edge, middle and classifier counts`);
   if (!isObject(f.perRoute)) p.push('final.perRoute must be an object');
   else {
     let sum = 0;

@@ -6,6 +6,7 @@
  * counted as dropped instead (Router.telemetry()), for the host to export as a metric.
  */
 import type { RuntimeErrorCode } from './errors.ts';
+import type { ReviewErrorCode } from './review.ts';
 
 export interface EventBase {
   releaseId: string;
@@ -35,10 +36,15 @@ export interface DecisionEvent extends EventBase {
   type: 'decision';
   outcome: 'route' | 'review' | 'abstain' | 'unavailable';
   routeId: string | null;
-  mechanism: 'rule' | 'classifier' | null;
+  mechanism: 'rule' | 'edge' | 'middle' | 'classifier' | null;
   reason: string | null;
   /** Decided by the rules tier without needing scores. */
   rulesSettled: boolean;
+  /**
+   * Which tier settled the request without the main encoder: 'rules' (rules and edge) or 'middle'
+   * (after the middle encoder); null when the main encoder's scores decided it.
+   */
+  settledBy?: 'rules' | 'middle' | null;
   /** A rules-settled request selected for monitoring: embedded after the result is returned, reported by its own diagnostic or monitoring_error event. */
   sampled: boolean;
   /** The decision embedded this request (monitoring samples don't count: see `sampled`). */
@@ -48,12 +54,21 @@ export interface DecisionEvent extends EventBase {
    * `samplingProbability` for rules-settled ones. Weight drift estimates by its inverse.
    */
   inclusionProbability: number;
+  /** The fired rule's id, or 'edge:<label>' when the edge tier fired the route. */
   firedRule: string | null;
+  /** What the edge tier decided (absent without an edge): labels it fired and dismissed. */
+  edge?: { fired: string[]; dismissed: string[] };
+  /** What the middle tier decided (absent when it did not run): labels it fired and dismissed. */
+  middle?: { fired: string[]; dismissed: string[] };
   dismissed: readonly string[];
   errorCode: RuntimeErrorCode | null;
-  timings: { totalMs: number; rulesMs: number; embedMs: number | null; scoreMs: number | null };
+  /** reviewMs: the review adapter call (absent when not run). */
+  /** middleMs: the middle encoder and its scoring (absent when the middle tier did not run). */
+  timings: { totalMs: number; rulesMs: number; embedMs: number | null; scoreMs: number | null; middleMs?: number | null; reviewMs?: number | null };
   calibratedProbabilities?: Readonly<Record<string, number>>;
   document?: DocumentTelemetry;
+  /** The review adapter's call for a review outcome: no text, no rationale. */
+  review?: { answered: boolean; adapterSha256: string; routeId: string | null; confidence: number | null; errorCode: ReviewErrorCode | null; forHuman: boolean; reviewMs: number };
 }
 
 /** A rules-settled request embedded for monitoring: what the classifier says, without changing the decision. */

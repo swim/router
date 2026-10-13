@@ -5,6 +5,7 @@
 import { isTimerMs, MAX_TIMER_MS } from './bytes.ts';
 import { encoderIdentityProblems, vectorProblems, type Encoder } from './identity.ts';
 import type { ReleaseSource } from './release.ts';
+import { reviewAdapterIdentityProblems, reviewAnswerProblem, type ReviewAdapter, type ReviewInput } from './review.ts';
 
 const withTimeout = async <T>(p: Promise<T>, ms: number): Promise<T | 'timeout'> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -85,6 +86,41 @@ export async function releaseSourceContractProblems(source: ReleaseSource, optio
     } catch {
       // Expected.
     }
+  }
+  return problems;
+}
+
+/**
+ * Problems with a review adapter (empty when it conforms): a valid identity; an in-schema answer
+ * (a listed route id or null, confidence in [0, 1] or null) for each sample text, within timeoutMs;
+ * and an already-aborted signal makes review reject promptly rather than answer. It does not test
+ * determinism: LLM answers aren't deterministic, and nothing downstream assumes they are.
+ */
+export async function reviewAdapterContractProblems(adapter: ReviewAdapter, options: { routes: ReviewInput['routes']; texts?: readonly string[]; timeoutMs?: number }): Promise<string[]> {
+  const texts = options.texts ?? ['I need a refund for a double charge', 'what are your opening hours?', 'ünïcödé text 🙂'];
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  if (!isTimerMs(timeoutMs)) return [`timeoutMs must be milliseconds in [1, ${MAX_TIMER_MS}]`];
+  if (!options.routes?.length) return ['routes must list at least one route'];
+  const problems = reviewAdapterIdentityProblems(adapter?.identity).map((p) => `identity: ${p}`);
+  if (problems.length) return problems;
+  const input = (text: string): ReviewInput => ({ text, routes: options.routes, evidence: { reason: 'near_threshold', fired: null, dismissed: [], probabilities: {} } });
+  for (const text of texts) {
+    try {
+      const answer = await withTimeout(Promise.resolve().then(() => adapter.review(input(text), { signal: new AbortController().signal })), timeoutMs);
+      if (answer === 'timeout') { problems.push(`review of ${JSON.stringify(text)} did not finish within ${timeoutMs} ms`); continue; }
+      const why = reviewAnswerProblem(answer, options.routes);
+      if (why) problems.push(`review of ${JSON.stringify(text)}: ${why}`);
+    } catch (e) {
+      problems.push(`review of ${JSON.stringify(text)} rejected: ${(e as Error).message}`);
+    }
+  }
+  const aborted = new AbortController();
+  aborted.abort();
+  try {
+    const r = await withTimeout(Promise.resolve().then(() => adapter.review(input(texts[0]), { signal: aborted.signal })), Math.min(timeoutMs, 1000));
+    problems.push(r === 'timeout' ? 'review with an aborted signal neither rejected nor answered within 1 s' : 'review with an already-aborted signal answered instead of rejecting');
+  } catch {
+    // Expected: cancellation rejects.
   }
   return problems;
 }

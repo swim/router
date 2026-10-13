@@ -3,7 +3,7 @@
  * buildRelease so the builder writes exactly what the loader accepts. Mode-dependent gate checks
  * (step 8) are separate: `enforcementProblems`.
  */
-import { checkRuleSetPairing, routerRuleSetHash, validateArtifact, validateDocumentArtifact, type ClassifierArtifact, type DocumentClassifierArtifact } from '@liquidau/embedding-classifier';
+import { checkRuleSetPairing, checkTierPairing, routerRuleSetHash, validateArtifact, validateDocumentArtifact, validateEdge, validateMiddle, type ClassifierArtifact, type DocumentClassifierArtifact, type EdgeDocument, type MiddleDocument } from '@liquidau/embedding-classifier';
 import { ruleSetHash, validateRuleSet, type RuleSet } from '@liquidau/rule-miner';
 
 import { canonicalJson, decodeJson, isSha256Hex, sha256Hex } from './bytes.ts';
@@ -37,6 +37,53 @@ export interface ReleaseDocuments {
   ruleSet: RuleSet;
   policy: RouterPolicy;
   evidence: ReleaseEvidence;
+  /** The edge tier's document, when the release has one. */
+  edge: EdgeDocument | null;
+  /** The middle tier's document, when the release has one (the model tier runs it). */
+  middle: MiddleDocument | null;
+}
+
+type Role = 'classifier' | 'rules' | 'policy' | 'evidence' | 'edge' | 'middle';
+
+/** The middle document of a release (null without one), validated, with its heads checked against the policy's routes. */
+function parseMiddle(bytes: Uint8Array | undefined, routes: readonly string[]): MiddleDocument | null {
+  if (!bytes) return null;
+  let middle: MiddleDocument;
+  try {
+    middle = validateMiddle(parse(bytes, 'middle document'));
+  } catch (e) {
+    if (e instanceof RouterLoadError) throw e;
+    throw new RouterLoadError('MIDDLE_INVALID', 'the middle document is invalid', [(e as Error).message]);
+  }
+  const unknown = Object.keys(middle.heads).filter((h) => !routes.includes(h));
+  if (unknown.length) throw new RouterLoadError('MIDDLE_INVALID', 'the middle tier decides for heads that are not routes', unknown);
+  return middle;
+}
+
+/** The edge document of a release (null without one), validated, with its heads checked against the policy's routes. */
+function parseEdge(bytes: Uint8Array | undefined, routes: readonly string[]): EdgeDocument | null {
+  if (!bytes) return null;
+  let edge: EdgeDocument;
+  try {
+    edge = validateEdge(parse(bytes, 'edge document'));
+  } catch (e) {
+    if (e instanceof RouterLoadError) throw e;
+    throw new RouterLoadError('EDGE_INVALID', 'the edge document is invalid', [(e as Error).message]);
+  }
+  const unknown = Object.keys(edge.heads).filter((h) => !routes.includes(h));
+  if (unknown.length) throw new RouterLoadError('EDGE_INVALID', 'the edge decides for heads that are not routes', unknown);
+  return edge;
+}
+
+/** Edge pairing between the manifest, the evidence and the file (empty when matched). */
+function edgeEvidencePairing(manifest: RouterManifest, evidence: ReleaseEvidence): string[] {
+  const edgeSha = manifest.files.edge?.sha256;
+  if (edgeSha && evidence.inputs.edgeSha256 !== edgeSha) return ['the evidence evaluated a different edge document (or none)'];
+  if (!edgeSha && evidence.inputs.edgeSha256 !== undefined) return ['the evidence evaluated an edge the release does not have'];
+  const middleSha = manifest.files.middle?.sha256;
+  if (middleSha && evidence.inputs.middleSha256 !== middleSha) return ['the evidence evaluated a different middle document (or none)'];
+  if (!middleSha && evidence.inputs.middleSha256 !== undefined) return ['the evidence evaluated a middle tier the release does not have'];
+  return [];
 }
 
 /** Reads one key within a deadline and size limit; the returned bytes are a private copy. */
@@ -99,12 +146,14 @@ export function combineGates(classifier: ClassifierArtifact['gates'], evaluation
  * labels, and every pairing (semantic rules hash, training.router, dismissal records, evidence inputs,
  * classifier embedding vs release identity, recorded gates).
  */
-export async function validateDocuments(manifestRaw: unknown, manifestSha256: string, files: Readonly<Record<'classifier' | 'rules' | 'policy' | 'evidence', Uint8Array>>): Promise<ReleaseDocuments> {
+export async function validateDocuments(manifestRaw: unknown, manifestSha256: string, files: Readonly<Record<'classifier' | 'rules' | 'policy' | 'evidence', Uint8Array> & { edge?: Uint8Array; middle?: Uint8Array }>): Promise<ReleaseDocuments> {
   const manifest = validateManifest(manifestRaw);
   const mismatched: string[] = [];
-  for (const role of ['classifier', 'rules', 'policy', 'evidence'] as const) {
-    const actual = await sha256Hex(files[role]);
-    if (actual !== manifest.files[role].sha256) mismatched.push(`${role} (${manifest.files[role].key}) has SHA-256 ${actual}, the manifest says ${manifest.files[role].sha256}`);
+  if (!!manifest.files.edge !== !!files.edge) mismatched.push(manifest.files.edge ? 'the manifest names an edge file that was not supplied' : 'an edge file was supplied but the manifest names none');
+  if (!!manifest.files.middle !== !!files.middle) mismatched.push(manifest.files.middle ? 'the manifest names a middle file that was not supplied' : 'a middle file was supplied but the manifest names none');
+  for (const role of ['classifier', 'rules', 'policy', 'evidence', ...(manifest.files.edge && files.edge ? ['edge' as const] : []), ...(manifest.files.middle && files.middle ? ['middle' as const] : [])] as Role[]) {
+    const actual = await sha256Hex(files[role]!);
+    if (actual !== manifest.files[role]!.sha256) mismatched.push(`${role} (${manifest.files[role]!.key}) has SHA-256 ${actual}, the manifest says ${manifest.files[role]!.sha256}`);
   }
   if (mismatched.length) throw new RouterLoadError('FILE_DIGEST_MISMATCH', 'release files do not match the manifest', mismatched);
 
@@ -133,10 +182,14 @@ export async function validateDocuments(manifestRaw: unknown, manifestSha256: st
   const evidence = validateEvidence(parse(files.evidence, 'evidence'));
   const expectedEvidence = documentRelease ? EVIDENCE_SCHEMA_DOCUMENT : EVIDENCE_SCHEMA;
   if (evidence.schema !== expectedEvidence) throw new RouterLoadError('UNSUPPORTED_SCHEMA', `a ${manifest.schema} release needs '${expectedEvidence}' evidence, not '${evidence.schema}'`);
+  const edge = parseEdge(files.edge, policy.priority);
+  const middle = parseMiddle(files.middle, policy.priority);
 
   const semantic = ruleSetHash(ruleSet);
   const pairing: string[] = [];
   if (semantic !== manifest.rulesSemanticHash) pairing.push(`the rule set's semantic hash is ${semantic}, the manifest says ${manifest.rulesSemanticHash}`);
+  pairing.push(...checkTierPairing(artifact, edge, middle).map((d) => `tier pairing: ${d}`));
+  pairing.push(...edgeEvidencePairing(manifest, evidence));
   let trained: string | undefined;
   try {
     trained = routerRuleSetHash(artifact);
@@ -163,8 +216,21 @@ export async function validateDocuments(manifestRaw: unknown, manifestSha256: st
   // the full chunk-encoder identity itself (its classifier describes pooled features, not the encoder).
   const embedding = document ? encoderIdentityDiff(manifest.embedding, document.encoderIdentity as EncoderIdentity) : classifierEmbeddingDiff(manifest.embedding, artifact.embedding);
   if (embedding.length) throw new RouterLoadError('EMBEDDING_MISMATCH', document ? "the envelope's encoder identity does not match the release encoder identity" : "the classifier's recorded embedding does not match the release encoder identity", embedding);
+  // Context features: the classifier's context spec and the manifest's context encoder, both or neither.
+  const ctx = document ? undefined : artifact.embedding.context, ctxId = manifest.contextEmbedding;
+  if (ctx || ctxId) {
+    const c = !ctx ? ['the release names a context encoder (contextEmbedding), but the classifier has no context features']
+      : !ctxId ? ['the classifier was trained with context features (embedding.context), but the release names no context encoder (contextEmbedding)']
+      : classifierEmbeddingDiff(ctxId, ctx).map((x) => `context ${x}`);
+    if (c.length) throw new RouterLoadError('EMBEDDING_MISMATCH', "the classifier's recorded context embedding does not match the release's context encoder", c);
+  }
+  // The middle tier: its document's encoder identity and the manifest's middle encoder (validateManifest requires both or neither).
+  if (middle) {
+    const m = classifierEmbeddingDiff(manifest.middleEmbedding!, middle.embedding).map((x) => `middle ${x}`);
+    if (m.length) throw new RouterLoadError('EMBEDDING_MISMATCH', "the middle document's embedding does not match the release's middle encoder (middleEmbedding)", m);
+  }
 
-  return { manifest, manifestSha256, artifact, document, ruleSet, policy, evidence };
+  return { manifest, manifestSha256, artifact, document, ruleSet, policy, evidence, edge, middle };
 }
 
 /** Steps 1-7: read and verify the manifest, then the referenced files (each read once), then validate. */
@@ -174,9 +240,13 @@ export async function readRelease(source: ReleaseSource, manifestKey: string, ex
   const actual = await sha256Hex(manifestBytes);
   if (actual !== expectedManifestSha256) throw new RouterLoadError('MANIFEST_DIGEST_MISMATCH', `the manifest's SHA-256 is ${actual}, deployment expects ${expectedManifestSha256}`);
   const manifest = validateManifest(parse(manifestBytes, 'manifest'));
-  const roles = ['classifier', 'rules', 'policy', 'evidence'] as const;
-  const bytes = await Promise.all(roles.map((role) => readBytes(source, manifest.files[role].key, limits.maxFileBytes, timeoutMs, signal)));
-  return validateDocuments(manifest, actual, { classifier: bytes[0], rules: bytes[1], policy: bytes[2], evidence: bytes[3] });
+  const roles = ['classifier', 'rules', 'policy', 'evidence', ...(manifest.files.edge ? ['edge' as const] : []), ...(manifest.files.middle ? ['middle' as const] : [])] as Role[];
+  const bytes = await Promise.all(roles.map((role) => readBytes(source, manifest.files[role]!.key, limits.maxFileBytes, timeoutMs, signal)));
+  const byRole = Object.fromEntries(roles.map((role, i) => [role, bytes[i]])) as Record<Role, Uint8Array | undefined>;
+  return validateDocuments(manifest, actual, {
+    classifier: byRole.classifier!, rules: byRole.rules!, policy: byRole.policy!, evidence: byRole.evidence!,
+    ...(byRole.edge ? { edge: byRole.edge } : {}), ...(byRole.middle ? { middle: byRole.middle } : {}),
+  });
 }
 
 /** Step 8 for enforcement: why this release must not act (empty when it may). Shadow mode needs none of these. */
@@ -196,6 +266,8 @@ export interface RulesReleaseDocuments {
   ruleSet: RuleSet;
   policy: RouterPolicy;
   evidence: ReleaseEvidence;
+  /** The edge tier's document (the rules tier runs it): its pairing with the classifier is checked by the model tier. */
+  edge: EdgeDocument | null;
 }
 
 /**
@@ -211,12 +283,12 @@ export async function readRulesRelease(source: ReleaseSource, manifestKey: strin
   const manifestSha256 = await sha256Hex(manifestBytes);
   if (manifestSha256 !== expectedManifestSha256) throw new RouterLoadError('MANIFEST_DIGEST_MISMATCH', `the manifest's SHA-256 is ${manifestSha256}, deployment expects ${expectedManifestSha256}`);
   const manifest = validateManifest(parse(manifestBytes, 'manifest'));
-  const roles = ['rules', 'policy', 'evidence'] as const;
-  const bytes = await Promise.all(roles.map((role) => readBytes(source, manifest.files[role].key, limits.maxFileBytes, timeoutMs, signal)));
+  const roles = ['rules', 'policy', 'evidence', ...(manifest.files.edge ? ['edge' as const] : [])] as Role[];
+  const bytes = await Promise.all(roles.map((role) => readBytes(source, manifest.files[role]!.key, limits.maxFileBytes, timeoutMs, signal)));
   const mismatched: string[] = [];
   for (const [i, role] of roles.entries()) {
     const actual = await sha256Hex(bytes[i]);
-    if (actual !== manifest.files[role].sha256) mismatched.push(`${role} (${manifest.files[role].key}) has SHA-256 ${actual}, the manifest says ${manifest.files[role].sha256}`);
+    if (actual !== manifest.files[role]!.sha256) mismatched.push(`${role} (${manifest.files[role]!.key}) has SHA-256 ${actual}, the manifest says ${manifest.files[role]!.sha256}`);
   }
   if (mismatched.length) throw new RouterLoadError('FILE_DIGEST_MISMATCH', 'release files do not match the manifest', mismatched);
   let ruleSet: RuleSet;
@@ -228,6 +300,7 @@ export async function readRulesRelease(source: ReleaseSource, manifestKey: strin
   }
   const policy = validatePolicy(parse(bytes[1], 'policy'), { ruleLabels: ruleSet.rules.map((r) => r.label) });
   const evidence = validateEvidence(parse(bytes[2], 'evidence'));
+  const edge = parseEdge(bytes[3], policy.priority);
   const documentRelease = manifest.schema === MANIFEST_SCHEMA_DOCUMENT;
   const expectedEvidence = documentRelease ? EVIDENCE_SCHEMA_DOCUMENT : EVIDENCE_SCHEMA;
   if (evidence.schema !== expectedEvidence) throw new RouterLoadError('UNSUPPORTED_SCHEMA', `a ${manifest.schema} release needs '${expectedEvidence}' evidence, not '${evidence.schema}'`);
@@ -243,8 +316,9 @@ export async function readRulesRelease(source: ReleaseSource, manifestKey: strin
     if (ins.featureIdentitySha256 !== manifest.featureIdentitySha256) pairing.push('the evidence evaluated another document feature identity (encoder or pipeline)');
     if (ins.servingMaxInputUtf8Bytes !== manifest.serving.maxInputUtf8Bytes) pairing.push(`the evidence was evaluated with a ${ins.servingMaxInputUtf8Bytes}-byte input limit, the manifest serves ${manifest.serving.maxInputUtf8Bytes}`);
   }
+  pairing.push(...edgeEvidencePairing(manifest, evidence));
   if (pairing.length) throw new RouterLoadError('PAIRING_MISMATCH', 'the release documents are not a matched set', pairing);
-  return { manifest, manifestSha256, ruleSet, policy, evidence };
+  return { manifest, manifestSha256, ruleSet, policy, evidence, edge };
 }
 
 /**

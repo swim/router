@@ -11,7 +11,8 @@
  *     as route() would in one process
  * Both tiers pin the same manifest digest; the model tier refuses a forward from any other release.
  */
-import { ruleSetMatcher } from '@liquidau/rule-miner';
+
+import { createEdgeTier, resolveStaticEncoder, type EdgeTier, type StaticEncoderOption } from './edge-tier.ts';
 
 import { deepFreeze, isTimerMs, MAX_TIMER_MS, now, platformProblems } from './bytes.ts';
 import { createSettler, type RuleFindings, type Settler } from './decision.ts';
@@ -19,9 +20,10 @@ import { RETRYABLE, RouterLoadError, type RuntimeErrorCode } from './errors.ts';
 import type { RouterEvent, TelemetryCounters } from './events.ts';
 import { MANIFEST_SCHEMA_DOCUMENT } from './manifest.ts';
 import { DEFAULT_LIMITS, readRulesRelease, rulesEnforcementProblems, type ReadLimits, type ReleaseSource } from './release.ts';
+import type { ReviewOptions } from './review.ts';
 import {
-  Background, decisionEvent, Drain, FORWARD_SCHEMA, requestIdOf, requestProblem, selectedForMonitoring, unavailableEvent, unavailableResult, wrapCandidate,
-  type EventContext, type ForwardedRequest, type RouteRequest, type RouteResult, type RouterMode,
+  answerReview, Background, decisionEvent, Drain, FORWARD_SCHEMA, makeReviewer, requestIdOf, requestProblem, reviewOptionProblems, selectedForMonitoring, unavailableEvent, unavailableResult, wrapCandidate,
+  type EventContext, type ForwardedRequest, type Reviewer, type RouteRequest, type RouteResult, type RouterMode,
 } from './serving.ts';
 
 export interface LoadRulesTierOptions {
@@ -41,6 +43,13 @@ export interface LoadRulesTierOptions {
   limits?: ReadLimits;
   /** Aborts loading. */
   signal?: AbortSignal;
+  /**
+   * The same review adapter as the model tier's: the rules alone can settle a request to review (every
+   * head dismissed with onAbstain 'review'), and both tiers must answer such a review alike.
+   */
+  review?: ReviewOptions;
+  /** Releases whose edge uses a static embedding: the same static encoder (or loader) the model tier is given. */
+  staticEncoder?: StaticEncoderOption;
 }
 
 /**
@@ -82,6 +91,7 @@ function optionProblems(o: LoadRulesTierOptions): string[] {
     const v = o.limits?.[k];
     if (v !== undefined && !(Number.isInteger(v) && v > 0)) p.push(`limits.${k} must be a positive integer`);
   }
+  p.push(...reviewOptionProblems(o.review));
   return p;
 }
 
@@ -97,7 +107,10 @@ export async function loadRulesTier(options: LoadRulesTierOptions): Promise<Rule
     if (why.length) throw new RouterLoadError('GATES_FAILED', 'refusing to enforce this release (it may be served in shadow mode)', why);
   }
   deepFreeze(docs.evidence);
-  return new LoadedRulesTier(docs.manifestSha256, deepFreeze(docs.manifest), ruleSetMatcher(deepFreeze(docs.ruleSet)), createSettler(deepFreeze(docs.policy)), options);
+  const policy = deepFreeze(docs.policy);
+  const reviewer = options.review ? await makeReviewer(options.review, options.monitoring.samplingSalt, policy) : null;
+  const edgeTier = createEdgeTier(deepFreeze(docs.ruleSet), docs.edge ? deepFreeze(docs.edge) : null, policy.priority, await resolveStaticEncoder(docs.edge ?? null, options.staticEncoder));
+  return new LoadedRulesTier(docs.manifestSha256, deepFreeze(docs.manifest), edgeTier, createSettler(policy), reviewer, options);
 }
 
 class LoadedRulesTier implements RulesTier {
@@ -105,20 +118,22 @@ class LoadedRulesTier implements RulesTier {
   readonly manifestSha256: string;
   readonly mode: RouterMode;
   readonly #manifest: Parameters<typeof requestProblem>[2];
-  readonly #matcher: ReturnType<typeof ruleSetMatcher>;
+  readonly #edge: EdgeTier;
   readonly #settler: Settler;
+  readonly #reviewer: Reviewer | null;
   readonly #sampleRate: number;
   readonly #salt: string;
   readonly #bg: Background;
   readonly #drain = new Drain();
   #closing: Promise<void> | null = null;
 
-  constructor(manifestSha256: string, manifest: Parameters<typeof requestProblem>[2], matcher: ReturnType<typeof ruleSetMatcher>, settler: Settler, o: LoadRulesTierOptions) {
+  constructor(manifestSha256: string, manifest: Parameters<typeof requestProblem>[2], edge: EdgeTier, settler: Settler, reviewer: Reviewer | null, o: LoadRulesTierOptions) {
+    this.#reviewer = reviewer;
     this.releaseId = manifest.releaseId;
     this.manifestSha256 = manifestSha256;
     this.mode = o.mode;
     this.#manifest = manifest;
-    this.#matcher = matcher;
+    this.#edge = edge;
     this.#settler = settler;
     this.#sampleRate = o.monitoring.sampleRate;
     this.#salt = o.monitoring.samplingSalt;
@@ -145,8 +160,8 @@ class LoadedRulesTier implements RulesTier {
     return { releaseId: this.releaseId, requestId, mode: this.mode, samplingProbability: this.#sampleRate };
   }
 
-  #forward(text: string, requestId: string, purpose: ForwardedRequest['purpose']): ForwardedRequest {
-    return { schema: FORWARD_SCHEMA, manifestSha256: this.manifestSha256, requestId, text, purpose, inclusionProbability: purpose === 'monitor' ? this.#sampleRate : 1 };
+  #forward(text: string, context: string | undefined, requestId: string, purpose: ForwardedRequest['purpose']): ForwardedRequest {
+    return { schema: FORWARD_SCHEMA, manifestSha256: this.manifestSha256, requestId, text, ...(context !== undefined ? { context } : {}), purpose, inclusionProbability: purpose === 'monitor' ? this.#sampleRate : 1 };
   }
 
   #unavailable(requestId: string, code: RuntimeErrorCode, totalMs: number): RulesTierOutcome {
@@ -165,17 +180,28 @@ class LoadedRulesTier implements RulesTier {
       if (problem) return this.#unavailable(requestId, problem, now() - t0);
       const text = request.text;
       const tr = now();
-      const found = this.#matcher.evaluate(text);
-      const rules: RuleFindings = { fired: found.fired, dismissed: found.dismissed };
+      let found: ReturnType<EdgeTier['evaluate']>;
+      try {
+        found = this.#edge.evaluate(text);
+      } catch {
+        return this.#unavailable(requestId, 'PREPROCESSING_FAILURE', now() - t0);
+      }
+      const rules: RuleFindings = found.findings;
       const settled = this.#settler.settle(rules);
       const rulesMs = now() - tr;
-      if (!settled) return { answered: false, forward: this.#forward(text, requestId, 'decide') };
+      if (!settled) return { answered: false, forward: this.#forward(text, request.context, requestId, 'decide') };
       const sampled = await selectedForMonitoring(this.releaseId, this.#salt, this.#sampleRate, requestId);
-      this.#bg.emit(decisionEvent(this.#base(requestId), settled, {
-        firedRule: rules.fired?.id ?? null, dismissed: rules.dismissed, rulesSettled: true, sampled, embedded: false, inclusionProbability: this.#sampleRate,
-        errorCode: null, timings: { totalMs: now() - t0, rulesMs, embedMs: null, scoreMs: null },
+      let final = settled;
+      let review: Awaited<ReturnType<typeof answerReview>> | null = null;
+      if (settled.outcome === 'review' && this.#reviewer) {
+        review = await answerReview(this.#reviewer, settled, { text, fired: rules.fired, dismissed: rules.dismissed, probabilities: {}, releaseId: this.releaseId, requestId, ...(request.signal ? { signal: request.signal } : {}) });
+        final = review.candidate;
+      }
+      this.#bg.emit(decisionEvent(this.#base(requestId), final, {
+        firedRule: rules.fired?.id ?? null, dismissed: rules.dismissed, ...(found.edge ? { edge: found.edge } : {}), rulesSettled: true, settledBy: 'rules', sampled, embedded: false, inclusionProbability: this.#sampleRate,
+        errorCode: null, timings: { totalMs: now() - t0, rulesMs, embedMs: null, scoreMs: null, ...(review ? { reviewMs: review.reviewMs } : {}) }, ...(review ? { review: review.review } : {}),
       }));
-      return { answered: true, result: wrapCandidate(this.mode, this.releaseId, requestId, settled, false), monitor: sampled ? this.#forward(text, requestId, 'monitor') : null };
+      return { answered: true, result: wrapCandidate(this.mode, this.releaseId, requestId, final, false), monitor: sampled ? this.#forward(text, request.context, requestId, 'monitor') : null };
     });
   }
 }

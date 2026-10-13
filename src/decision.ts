@@ -21,6 +21,7 @@ import { decide as classifierDecide, settleWithRules, type Decision, type Decisi
 
 import { deepFreeze, jsonClone } from './bytes.ts';
 import { validatePolicy, type RouterPolicy } from './policy.ts';
+import type { ReviewAnswerFields } from './review.ts';
 
 /** A head's decision-relevant numbers: the restricted projection of a classifier head. */
 export interface HeadProjection {
@@ -34,7 +35,16 @@ export interface DecisionModel {
 
 /** What the rules tier found for one message: rule-miner's `ruleSetMatcher(set).evaluate(text)`. */
 export interface RuleFindings {
-  fired: { id: string; label: string } | null;
+  /**
+   * `source` 'edge': the edge tier fired this label (id 'edge:<label>'); 'middle': the middle tier did
+   * (id 'middle:<label>'); absent or 'rule': a rule did.
+   */
+  fired: { id: string; label: string; source?: 'rule' | 'edge' | 'middle' } | null;
+  /**
+   * Every head fired, by a rule, the edge or the middle tier, highest priority first (`fired` is its
+   * first entry). Each counts as at its threshold, as certification counted it. Absent: `fired` alone.
+   */
+  firing?: ReadonlyArray<{ id: string; label: string; source?: 'rule' | 'edge' | 'middle' }>;
   dismissed: readonly string[];
 }
 
@@ -42,8 +52,8 @@ export type ReviewReason = 'near_threshold' | 'abstention_policy';
 export type AbstainReason = 'no_match' | 'all_dismissed';
 
 export type Candidate =
-  | { outcome: 'route'; routeId: string; destination: string; mechanism: 'rule' | 'classifier' }
-  | { outcome: 'review'; reason: ReviewReason }
+  | { outcome: 'route'; routeId: string; destination: string; mechanism: 'rule' | 'edge' | 'middle' | 'classifier' }
+  | ({ outcome: 'review'; reason: ReviewReason } & ReviewAnswerFields)
   | { outcome: 'abstain'; reason: AbstainReason };
 
 /** A probability the policy needs is missing, non-finite or outside [0, 1]. Maps to INVALID_SCORE. */
@@ -69,6 +79,11 @@ export interface Settler {
   settle(rules: RuleFindings): Candidate | null;
 }
 
+/** Every fired head of a finding: `firing`, or `fired` alone. */
+export function firingOf(rules: RuleFindings): ReadonlyArray<NonNullable<RuleFindings['fired']>> {
+  return rules.firing ?? (rules.fired ? [rules.fired] : []);
+}
+
 /** The policy-only half shared by the settler and the evaluator: label checks, settlement and result shapes. */
 function policyParts(policy: RouterPolicy) {
   const p = deepFreeze(jsonClone(policy));
@@ -76,14 +91,20 @@ function policyParts(policy: RouterPolicy) {
   const destination = new Map(p.routes.map((r) => [r.id, r.destination]));
   const routes = new Set(p.priority);
   const check = (rules: RuleFindings) => {
-    if (rules.fired !== null && !routes.has(rules.fired.label)) throw new Error(`rule ${rules.fired.id} fired ${rules.fired.label}, which is not a route`);
+    for (const f of firingOf(rules)) {
+      if (!routes.has(f.label)) throw new Error(`rule ${f.id} fired ${f.label}, which is not a route`);
+      if (rules.dismissed.includes(f.label)) throw new Error(`conflicting findings: ${f.id} fires ${f.label}, which is also dismissed`);
+    }
     for (const d of rules.dismissed) if (!routes.has(d)) throw new Error(`dismissed label ${d} is not a route`);
     if (rules.fired !== null && rules.dismissed.includes(rules.fired.label)) {
       throw new Error(`conflicting findings: rule ${rules.fired.id} fires ${rules.fired.label}, which is also dismissed (rule-miner's matcher never reports both)`);
     }
   };
   const candidate = (d: Decision<string>, rules: RuleFindings): Candidate => {
-    if (d.head !== null) return { outcome: 'route', routeId: d.head, destination: destination.get(d.head)!, mechanism: d.reason === 'rule' ? 'rule' : 'classifier' };
+    if (d.head !== null) {
+      const source = d.reason === 'rule' ? firingOf(rules).find((f) => f.label === d.head)?.source ?? 'rule' : 'classifier';
+      return { outcome: 'route', routeId: d.head, destination: destination.get(d.head)!, mechanism: source };
+    }
     if (d.reason === 'near_threshold') return { outcome: 'review', reason: 'near_threshold' };
     if (p.onAbstain === 'review') return { outcome: 'review', reason: 'abstention_policy' };
     const off = new Set(rules.dismissed);
@@ -125,7 +146,8 @@ export function createDecisionEvaluator(model: DecisionModel, policy: RouterPoli
   const artifact: DecisionHeads<string> = deepFreeze({ heads });
   const required = (rules: RuleFindings) => {
     const off = new Set(rules.dismissed);
-    return p.priority.filter((h) => !off.has(h) && h !== rules.fired?.label);
+    const on = new Set(firingOf(rules).map((f) => f.label));
+    return p.priority.filter((h) => !off.has(h) && !on.has(h));
   };
 
   return Object.freeze({
@@ -143,7 +165,7 @@ export function createDecisionEvaluator(model: DecisionModel, policy: RouterPoli
       }
       let d: Decision<string>;
       try {
-        d = classifierDecide(artifact, scores, classifierPolicy, rules.dismissed, rules.fired?.label ?? null);
+        d = classifierDecide(artifact, scores, classifierPolicy, rules.dismissed, firingOf(rules).map((f) => f.label));
       } catch (e) {
         throw new ScoreError((e as Error).message);
       }

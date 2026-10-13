@@ -30,12 +30,23 @@ export interface RouterManifest {
   releaseId: string;
   /** ISO 8601. */
   createdAt: string;
-  files: { classifier: FileRef; rules: FileRef; policy: FileRef; evidence: FileRef };
+  /**
+   * `edge`: the edge tier's document (embedding-classifier's 'liquidau-edge/1'), when the release has one.
+   * `middle`: the middle tier's document ('liquidau-middle/1'; legacy releases with an edge only).
+   */
+  files: { classifier: FileRef; rules: FileRef; policy: FileRef; evidence: FileRef; edge?: FileRef; middle?: FileRef };
   /** '/2' only: the envelope's document feature identity (chunk encoder AND pipeline). */
   featureIdentitySha256?: string;
   /** rule-miner's ruleSetHash of the validated rule set: rule semantics, not bytes. */
   rulesSemanticHash: string;
   embedding: EncoderIdentity;
+  /**
+   * Legacy releases with context features: the context encoder's identity (the classifier's
+   * embedding.context). Requests then carry `context`, embedded by an adapter implementing exactly this.
+   */
+  contextEmbedding?: EncoderIdentity;
+  /** Releases with a middle tier: its encoder's identity (the middle document's embedding). */
+  middleEmbedding?: EncoderIdentity;
   serving: { ruleInput: 'original'; maxInputUtf8Bytes: number };
   /** Complete-release gates: the classifier's gates combined with the final-system evaluation's. */
   gates: ReleaseGates;
@@ -54,8 +65,8 @@ export const COMPATIBLE_PACKAGES: Readonly<Record<string, string>> = Object.free
 const RECORDED_PACKAGES = ['@liquidau/embedding-classifier', '@liquidau/rule-miner', '@liquidau/router'] as const;
 
 /** Packages a manifest must record: text-preprocessing only for document releases. */
-export const requiredPackages = (schema: RouterManifest['schema']): string[] =>
-  [...RECORDED_PACKAGES, ...(schema === MANIFEST_SCHEMA_DOCUMENT ? ['@liquidau/text-preprocessing'] : [])];
+export const requiredPackages = (schema: RouterManifest['schema'], edge = false): string[] =>
+  [...RECORDED_PACKAGES, ...(schema === MANIFEST_SCHEMA_DOCUMENT || edge ? ['@liquidau/text-preprocessing'] : [])];
 
 const SEGMENT = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
 
@@ -88,14 +99,17 @@ export function validateManifest(raw: unknown): RouterManifest {
   if (raw.schema !== MANIFEST_SCHEMA && raw.schema !== MANIFEST_SCHEMA_DOCUMENT) throw new RouterLoadError('UNSUPPORTED_SCHEMA', `unsupported manifest schema ${JSON.stringify(raw.schema)} (this router reads '${MANIFEST_SCHEMA}' and '${MANIFEST_SCHEMA_DOCUMENT}')`);
   const documentRelease = raw.schema === MANIFEST_SCHEMA_DOCUMENT;
   const p: string[] = [];
-  const known = ['schema', 'releaseId', 'createdAt', 'files', 'rulesSemanticHash', 'embedding', 'serving', 'gates', 'packages', ...(documentRelease ? ['featureIdentitySha256'] : [])];
+  const known = ['schema', 'releaseId', 'createdAt', 'files', 'rulesSemanticHash', 'embedding', 'serving', 'gates', 'packages', ...(documentRelease ? ['featureIdentitySha256'] : ['contextEmbedding', 'middleEmbedding'])];
   for (const k of Object.keys(raw)) if (!known.includes(k)) p.push(`unknown field ${k}`);
   if (typeof raw.releaseId !== 'string' || !raw.releaseId.length || raw.releaseId.length > 256) p.push('releaseId must be a non-empty string of at most 256 characters');
   if (typeof raw.createdAt !== 'string' || !ISO.test(raw.createdAt) || !Number.isFinite(Date.parse(raw.createdAt))) p.push('createdAt must be an ISO 8601 date-time');
   const files = raw.files;
   if (!isObject(files)) p.push('files must be an object');
   else {
-    const roles = ['classifier', 'rules', 'policy', 'evidence'];
+    const roles = ['classifier', 'rules', 'policy', 'evidence', ...('edge' in files ? ['edge'] : []), ...('middle' in files ? ['middle'] : [])];
+    if ('middle' in files && documentRelease) p.push('a document release cannot have a middle tier');
+    if ('middle' in files && !('edge' in files)) p.push('files.middle needs files.edge (the middle tier sits behind the edge)');
+    if ('middle' in files !== (raw.middleEmbedding !== undefined)) p.push('files.middle and middleEmbedding must be present together');
     for (const k of Object.keys(files)) if (!roles.includes(k)) p.push(`unknown file role ${k}`);
     const keys = new Set<string>();
     for (const role of roles) {
@@ -110,6 +124,8 @@ export function validateManifest(raw: unknown): RouterManifest {
   if (!isSha256Hex(raw.rulesSemanticHash)) p.push('rulesSemanticHash must be lowercase hex SHA-256');
   if (documentRelease && !isSha256Hex(raw.featureIdentitySha256)) p.push('featureIdentitySha256 must be lowercase hex SHA-256 in a document release');
   p.push(...encoderIdentityProblems(raw.embedding).map((e) => `embedding ${e}`));
+  if (raw.contextEmbedding !== undefined) p.push(...encoderIdentityProblems(raw.contextEmbedding).map((e) => `contextEmbedding ${e}`));
+  if (raw.middleEmbedding !== undefined) p.push(...encoderIdentityProblems(raw.middleEmbedding).map((e) => `middleEmbedding ${e}`));
   const serving = raw.serving;
   if (!isObject(serving) || Object.keys(serving).some((k) => k !== 'ruleInput' && k !== 'maxInputUtf8Bytes')) p.push('serving must be { ruleInput, maxInputUtf8Bytes }');
   else {
@@ -122,7 +138,7 @@ export function validateManifest(raw: unknown): RouterManifest {
 
   const packages = raw.packages as Record<string, string>;
   const pk: string[] = [];
-  for (const name of requiredPackages(raw.schema as RouterManifest['schema'])) if (packages[name] === undefined) pk.push(`${name}: build-time version not recorded`);
+  for (const name of requiredPackages(raw.schema as RouterManifest['schema'], isObject(raw.files) && 'edge' in raw.files)) if (packages[name] === undefined) pk.push(`${name}: build-time version not recorded`);
   for (const [name, version] of Object.entries(packages)) { const why = packageProblem(name, version); if (why) pk.push(why); }
   if (pk.length) throw new RouterLoadError('PACKAGE_INCOMPATIBLE', 'the release does not record its build-time package versions exactly', pk);
   return raw as unknown as RouterManifest;

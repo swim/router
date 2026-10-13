@@ -16,7 +16,7 @@
  * recall still counts the item against every acceptable route it was not sent to - choosing one of
  * several true labels does not satisfy each label's recall.
  */
-import type { Candidate, DecisionEvaluator, DecisionModel, RuleFindings } from '../decision.ts';
+import { firingOf, type Candidate, type DecisionEvaluator, type DecisionModel, type RuleFindings } from '../decision.ts';
 import type { ClaimKind, EvidenceClaim, ReleaseEvidence } from '../evidence.ts';
 import type { ReleaseGates } from '../manifest.ts';
 
@@ -53,7 +53,7 @@ export interface HeadReport {
   recall: Rate;
   precision: Rate;
   falseAlarmRate: Rate;
-  /** Items whose first firing rule named this head. */
+  /** Items where a rule, the edge or the middle tier fired this head. */
   ruleFired: number;
   /** Items where a dismissal rule cleared this head. */
   dismissed: number;
@@ -78,14 +78,15 @@ export function evaluatePerHead(model: DecisionModel, items: readonly PerHeadIte
   for (const [h, proj] of Object.entries(model.heads)) {
     let tp = 0, fp = 0, fn = 0, tn = 0, ruleFired = 0, dismissed = 0, ruleOnly = 0;
     for (const it of items) {
-      if (it.rules.fired && it.rules.dismissed.includes(it.rules.fired.label)) throw new Error(`conflicting findings: ${it.rules.fired.label} both fires and is dismissed (rule-miner's matcher never reports both)`);
+      const firedLabels = firingOf(it.rules).map((f) => f.label);
+      for (const l of firedLabels) if (it.rules.dismissed.includes(l)) throw new Error(`conflicting findings: ${l} both fires and is dismissed`);
       const off = it.rules.dismissed.includes(h);
-      const fired = it.rules.fired?.label === h && !off;
+      const fired = firedLabels.includes(h) && !off;
       const score = it.scores[h];
       if (!off && !fired && (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 1)) throw new Error(`item has no valid probability for head ${h}`);
       const byModel = !off && typeof score === 'number' && score >= proj.threshold;
       const positive = fired || byModel;
-      if (it.rules.fired?.label === h) ruleFired++;
+      if (firedLabels.includes(h)) ruleFired++;
       if (off) dismissed++;
       if (fired && !byModel) ruleOnly++;
       const y = it.labels[h];
@@ -104,7 +105,10 @@ export function evaluatePerHead(model: DecisionModel, items: readonly PerHeadIte
 
 export interface FinalItem {
   id: string;
+  /** Every tier's findings before the classifier: rules, the edge and (with a middle tier) the middle. */
   rules: RuleFindings;
+  /** With a middle tier: the findings before it (rules and edge), so rules- and middle-settled items are told apart. */
+  beforeMiddle?: RuleFindings;
   /** Always-embed calibrated probabilities (the reference decision needs them). */
   scores: Readonly<Record<string, number>>;
   /** Routes that would be acceptable for this item; empty: it should not be routed. */
@@ -133,11 +137,14 @@ export interface FinalReport {
   routedAccuracy: Rate;
   /** Of items that should not be routed, the share routed anyway. */
   falseRouteRate: Rate;
-  mechanism: { rule: number; classifier: number };
+  /** Routes by mechanism; `edge` / `middle` only when the evaluated system had those tiers. */
+  mechanism: { rule: number; classifier: number; edge?: number; middle?: number };
   /** Items where some firing rule matched. */
   ruleFiringRate: Rate;
   /** Items the rules tier settled without scores. */
   rulesSettlementRate: Rate;
+  /** With a middle tier: items the middle tier settled (the rules tier had not), without the main encoder. */
+  middleSettlementRate?: Rate;
   /** Items where the rules-settled decision differed from the always-embed reference (must be 0). */
   pathMismatches: string[];
   perRoute: Record<string, RouteReport>;
@@ -152,8 +159,9 @@ const sameCandidate = (a: Candidate, b: Candidate) => JSON.stringify(a) === JSON
 export function evaluateFinal(evaluator: DecisionEvaluator, items: readonly FinalItem[]): FinalReport {
   const routes = evaluator.priority;
   const outcomes = { route: 0, review: 0, abstain: 0 };
-  const mechanism = { rule: 0, classifier: 0 };
-  let correct = 0, shouldNot = 0, routedWrongly = 0, fired = 0, settledCount = 0;
+  const mechanism: { rule: number; classifier: number; edge?: number; middle?: number } = { rule: 0, classifier: 0 };
+  let correct = 0, shouldNot = 0, routedWrongly = 0, fired = 0, settledCount = 0, middleSettled = 0;
+  const withMiddle = items.some((it) => it.beforeMiddle !== undefined);
   const mismatches: string[] = [];
   const perRoute = new Map(routes.map((r) => [r, { routed: 0, correct: 0, support: 0, hit: 0 }]));
   const confusion: Record<string, Record<string, number>> = {};
@@ -162,14 +170,17 @@ export function evaluateFinal(evaluator: DecisionEvaluator, items: readonly Fina
     for (const r of it.acceptable) if (!perRoute.has(r)) throw new Error(`item ${it.id} lists unknown route ${r}`);
     const reference = evaluator.decide(it.rules, it.scores);
     const settled = evaluator.settle(it.rules);
-    if (settled) settledCount++;
+    if (withMiddle) {
+      if (evaluator.settle(it.beforeMiddle ?? it.rules)) settledCount++;
+      else if (settled) middleSettled++;
+    } else if (settled) settledCount++;
     if (settled && !sameCandidate(settled, reference)) mismatches.push(it.id);
     if (it.rules.fired) fired++;
     const c = reference;
     outcomes[c.outcome]++;
     const ok = c.outcome === 'route' && it.acceptable.includes(c.routeId);
     if (c.outcome === 'route') {
-      mechanism[c.mechanism]++;
+      mechanism[c.mechanism] = (mechanism[c.mechanism] ?? 0) + 1;
       if (ok) correct++;
       const pr = perRoute.get(c.routeId)!;
       pr.routed++;
@@ -193,7 +204,7 @@ export function evaluateFinal(evaluator: DecisionEvaluator, items: readonly Fina
     kind: 'final-routing', bounds: 'empirical', items: n, outcomes,
     coverage: rate(outcomes.route, n), reviewRate: rate(outcomes.review, n), abstainRate: rate(outcomes.abstain, n),
     routedAccuracy: rate(correct, outcomes.route), falseRouteRate: rate(routedWrongly, shouldNot), mechanism,
-    ruleFiringRate: rate(fired, n), rulesSettlementRate: rate(settledCount, n), pathMismatches: mismatches,
+    ruleFiringRate: rate(fired, n), rulesSettlementRate: rate(settledCount, n), ...(withMiddle ? { middleSettlementRate: rate(middleSettled, n) } : {}), pathMismatches: mismatches,
     perRoute: Object.fromEntries([...perRoute].map(([r, v]) => [r, { routed: v.routed, precision: rate(v.correct, v.routed), recall: rate(v.hit, v.support) }])),
     confusion,
     slices: Object.fromEntries([...slices].map(([k, s]) => [k, { items: s.items, coverage: rate(s.routed, s.items), routedAccuracy: rate(s.correct, s.routed), reviewRate: rate(s.review, s.items) }])),

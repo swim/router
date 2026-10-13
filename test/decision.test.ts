@@ -12,13 +12,14 @@ const HEADS: H[] = ['a', 'b', 'c'];
  */
 function oracle(model: DecisionModel, policy: RouterPolicy, rules: RuleFindings, scores: Record<string, number>): Candidate {
   const off = new Set(rules.dismissed);
-  const fired = rules.fired?.label ?? null; // the matcher never reports a fired head as dismissed
-  const reaches = (h: string, level: 'threshold' | 'reviewFloor') => (h === fired ? true : off.has(h) ? false : scores[h] >= model.heads[h][level]);
+  // Every fired head (rules, edge or middle) counts as reaching its threshold; never also dismissed.
+  const fired = new Set((rules.firing ?? (rules.fired ? [rules.fired] : [])).map((f) => f.label));
+  const reaches = (h: string, level: 'threshold' | 'reviewFloor') => (fired.has(h) ? true : off.has(h) ? false : scores[h] >= model.heads[h][level]);
   const blocked = new Set<string>();
   for (const s of policy.suppress) if (s.when.some((w) => reaches(w, 'reviewFloor'))) for (const h of s.heads) blocked.add(h);
   for (const h of policy.priority) {
     if (blocked.has(h) || !reaches(h, 'threshold')) continue;
-    return { outcome: 'route', routeId: h, destination: `dest:${h}`, mechanism: h === fired ? 'rule' : 'classifier' };
+    return { outcome: 'route', routeId: h, destination: `dest:${h}`, mechanism: fired.has(h) ? 'rule' : 'classifier' };
   }
   if (policy.priority.some((h) => reaches(h, 'reviewFloor'))) return { outcome: 'review', reason: 'near_threshold' };
   if (policy.onAbstain === 'review') return { outcome: 'review', reason: 'abstention_policy' };
@@ -39,6 +40,8 @@ const POLICIES: Record<string, RouterPolicy> = {
   guarded: policy(['a', 'b', 'c'], [{ when: ['a'], heads: ['c'] }]),
   twoGuards: policy(['c', 'b', 'a'], [{ when: ['a', 'b'], heads: ['c'] }], 'review'),
   guardedFirst: policy(['b', 'a', 'c'], [{ when: ['c'], heads: ['a'] }, { when: ['c'], heads: ['b'] }]),
+  // A suppression chain: fired heads suppress higher-priority fired heads (c over b over a).
+  chain: policy(['a', 'b', 'c'], [{ when: ['b'], heads: ['a'] }, { when: ['c'], heads: ['b'] }]),
 };
 
 /** Scores below, at and above each boundary, plus 0 and 1. */
@@ -48,10 +51,12 @@ function grid(m: DecisionModel['heads'][string]): number[] {
 }
 
 function* findings(): Generator<RuleFindings> {
-  for (const fired of [null, ...HEADS]) {
+  // Every set of fired heads (one or several, as rules, the edge and the middle tier can fire) and every disjoint dismissal.
+  for (let fmask = 0; fmask < 8; fmask++) {
+    const firing = HEADS.filter((_, i) => fmask & (1 << i)).map((h) => ({ id: `rule-${h}`, label: h }));
     for (let mask = 0; mask < 8; mask++) {
-      if (fired && mask & (1 << HEADS.indexOf(fired))) continue; // conflicting: rejected, tested below
-      yield { fired: fired ? { id: `rule-${fired}`, label: fired } : null, dismissed: HEADS.filter((_, i) => mask & (1 << i)) };
+      if (fmask & mask) continue; // conflicting: rejected, tested below
+      yield { fired: firing[0] ?? null, firing, dismissed: HEADS.filter((_, i) => mask & (1 << i)) };
     }
   }
 }

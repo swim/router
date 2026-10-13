@@ -77,6 +77,8 @@ export interface Tweaks {
   evidence?: (e: ReleaseEvidence) => void;
   /** The release encoder identity (default IDENTITY); set the artifact's embedding to match. */
   identity?: EncoderIdentity;
+  /** The release's context encoder identity (releases with context features). */
+  contextEmbedding?: EncoderIdentity;
   gatesPassed?: boolean;
   evaluationPasses?: boolean;
 }
@@ -104,7 +106,7 @@ export async function makeRelease(tweaks: Tweaks = {}): Promise<BuiltRelease> {
   });
   tweaks.evidence?.(evidence);
   return buildRelease({
-    releaseId: 'release-1', createdAt: '2026-10-07T00:00:00Z', documents: { ...documents, evidence: encodeJson(evidence) }, embedding: tweaks.identity ?? IDENTITY,
+    releaseId: 'release-1', createdAt: '2026-10-07T00:00:00Z', documents: { ...documents, evidence: encodeJson(evidence) }, embedding: tweaks.identity ?? IDENTITY, ...(tweaks.contextEmbedding ? { contextEmbedding: tweaks.contextEmbedding } : {}),
     serving: { maxInputUtf8Bytes: 4096 }, packages: { '@liquidau/embedding-classifier': '0.8.0', '@liquidau/rule-miner': '0.5.1', '@liquidau/router': '0.1.0' },
   });
 }

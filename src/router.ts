@@ -12,19 +12,21 @@
  * their decision, and its failure is a diagnostic, not `unavailable`. Monitoring and observer delivery
  * run after the result is returned: `flush()` (and `close()`) wait for them.
  */
-import { DocumentError, prepareScoring, scoreDocument, scoreEmbedding, type ClassifierArtifact, type DocumentAdapters, type DocumentClassifierArtifact, type Scores } from '@liquidau/embedding-classifier';
-import { ruleSetMatcher } from '@liquidau/rule-miner';
+import { DocumentError, prepareScoring, scoreDocument, scoreEmbedding, type ClassifierArtifact, type DocumentAdapters, type DocumentClassifierArtifact, type MiddleDocument, type Scores } from '@liquidau/embedding-classifier';
 
 import { canonicalJson, deepFreeze, isTimerMs, MAX_TIMER_MS, now, platformProblems } from './bytes.ts';
 import { createDecisionEvaluator, ScoreError, type Candidate, type DecisionEvaluator, type RuleFindings } from './decision.ts';
+import { createEdgeTier, mergeMiddle, middleDecisions, middleHeads, resolveStaticEncoder, type EdgeTier, type StaticEncoderOption } from './edge-tier.ts';
 import { EncoderError, RETRYABLE, RouterLoadError, type RuntimeErrorCode } from './errors.ts';
 import type { DecisionEvent, DocumentTelemetry, RouterEvent, TelemetryCounters } from './events.ts';
 import { encoderIdentityDiff, encoderIdentityProblems, vectorProblems, type Encoder, type EncoderIdentity } from './identity.ts';
 import type { RouterManifest } from './manifest.ts';
 import { DEFAULT_LIMITS, enforcementProblems, readRelease, type ReadLimits, type ReleaseSource } from './release.ts';
+import type { RouterPolicy } from './policy.ts';
+import type { ReviewOptions } from './review.ts';
 import {
-  Background, decisionEvent, Drain, forwardProblem, requestIdOf, requestProblem, selectedForMonitoring, unavailableEvent, unavailableResult, wrapCandidate,
-  type EventContext, type ForwardedRequest, type RouteRequest, type RouteResult, type RouterMode,
+  answerReview, Background, decisionEvent, Drain, forwardProblem, makeReviewer, requestIdOf, requestProblem, reviewOptionProblems, selectedForMonitoring, unavailableEvent, unavailableResult, wrapCandidate,
+  type EventContext, type ForwardedRequest, type Reviewer, type RouteRequest, type RouteResult, type RouterMode,
 } from './serving.ts';
 
 export type { ForwardedRequest, RouteRequest, RouteResult, RouterMode };
@@ -37,7 +39,23 @@ export interface LoadRouterOptions {
   /** Required, no default. */
   mode: RouterMode;
   encoder: Encoder;
-  /** Deadline for each release read at load and for each request's embedding. */
+  /**
+   * Releases with context features (manifest contextEmbedding) only, and required by them: the adapter
+   * that embeds each request's `context`, implementing exactly the release's context encoder identity.
+   * It may be the same model as `encoder` or a different one.
+   */
+  contextEncoder?: Encoder;
+  /**
+   * Releases with a middle tier (manifest middleEmbedding) only, and required by them: the adapter that
+   * embeds each request the rules and the edge leave undecided, for the middle tier's fire/dismiss
+   * decisions, implementing exactly the release's middle encoder identity. A request the middle tier
+   * settles never reaches `encoder`.
+   */
+  middleEncoder?: Encoder;
+  /**
+   * Deadline for each release read at load, and for the model tier of each request: the middle encoder
+   * and the main embedding (message and context in parallel) share it.
+   */
   timeoutMs: number;
   monitoring: {
     /** Share of rules-settled requests embedded for monitoring, in [0, 1]. */
@@ -66,6 +84,18 @@ export interface LoadRouterOptions {
    * loop. Operational only: never changes outputs. The deadline is checked at every planning step anyway.
    */
   document?: { batchSize?: number; concurrency?: number; yieldEvery?: number };
+  /**
+   * A review adapter (review.ts): every `review` result is sent to it, under its own deadline, and
+   * carries its advisory answer (or answerError) and a forHuman flag. The decision never changes.
+   */
+  review?: ReviewOptions;
+  /**
+   * Releases with an edge tier whose edge uses a static embedding: the static encoder it was trained
+   * with (text-preprocessing's createStaticEmbedder over the same tokenizer and weight bytes). Loading
+   * refuses any other (STATIC_ENCODER_MISMATCH). A function is called only for such releases, so the
+   * weight table is loaded only when needed.
+   */
+  staticEncoder?: StaticEncoderOption;
 }
 
 export interface Router {
@@ -128,6 +158,14 @@ function optionProblems(o: LoadRouterOptions): string[] {
   if (o.observer !== undefined && typeof o.observer !== 'function') p.push('observer must be a function');
   if (o.observerTimeoutMs !== undefined && !isTimerMs(o.observerTimeoutMs)) p.push(`observerTimeoutMs must be milliseconds in [1, ${MAX_TIMER_MS}]`);
   for (const k of ['tokenizer', 'boundaryTokenizer'] as const) if (o[k] !== undefined && (typeof o[k]?.countInput !== 'function' || typeof o[k]?.cutOffsets !== 'function')) p.push(`${k} must implement countInput and cutOffsets`);
+  if (o.contextEncoder !== undefined) {
+    if (typeof o.contextEncoder?.embed !== 'function') p.push('contextEncoder must implement embed(texts, { signal })');
+    else p.push(...encoderIdentityProblems(o.contextEncoder.identity).map((e) => `contextEncoder identity ${e}`));
+  }
+  if (o.middleEncoder !== undefined) {
+    if (typeof o.middleEncoder?.embed !== 'function') p.push('middleEncoder must implement embed(texts, { signal })');
+    else p.push(...encoderIdentityProblems(o.middleEncoder.identity).map((e) => `middleEncoder identity ${e}`));
+  }
   if (o.boundaryEncoder !== undefined) {
     if (typeof o.boundaryEncoder?.embed !== 'function') p.push('boundaryEncoder must implement embed(texts, { signal })');
     else p.push(...encoderIdentityProblems(o.boundaryEncoder.identity).map((e) => `boundaryEncoder identity ${e}`));
@@ -139,6 +177,7 @@ function optionProblems(o: LoadRouterOptions): string[] {
     const v = o.limits?.[k];
     if (v !== undefined && !(Number.isInteger(v) && v > 0)) p.push(`limits.${k} must be a positive integer`);
   }
+  p.push(...reviewOptionProblems(o.review));
   return p;
 }
 
@@ -155,6 +194,20 @@ export async function loadRouter(options: LoadRouterOptions): Promise<Router> {
   const identity = deepFreeze(JSON.parse(JSON.stringify(options.encoder.identity)) as EncoderIdentity);
   const diff = encoderIdentityDiff(docs.manifest.embedding, identity);
   if (diff.length) throw new RouterLoadError('ENCODER_IDENTITY_MISMATCH', 'the encoder does not implement the release encoder identity', diff);
+  let contextIdentity: Readonly<EncoderIdentity> | null = null;
+  if (docs.manifest.contextEmbedding) {
+    if (!options.contextEncoder) throw new RouterLoadError('CAPABILITY_MISSING', 'this release scores context features: supply contextEncoder for its context encoder identity');
+    contextIdentity = deepFreeze(JSON.parse(JSON.stringify(options.contextEncoder.identity)) as EncoderIdentity);
+    const cd = encoderIdentityDiff(docs.manifest.contextEmbedding, contextIdentity);
+    if (cd.length) throw new RouterLoadError('ENCODER_IDENTITY_MISMATCH', 'the context encoder does not implement the release context encoder identity', cd);
+  } else if (options.contextEncoder) throw new RouterLoadError('OPTIONS_INVALID', 'contextEncoder was supplied, but this release has no context features');
+  let middleIdentity: Readonly<EncoderIdentity> | null = null;
+  if (docs.manifest.middleEmbedding) {
+    if (!options.middleEncoder) throw new RouterLoadError('CAPABILITY_MISSING', 'this release has a middle tier: supply middleEncoder for its middle encoder identity');
+    middleIdentity = deepFreeze(JSON.parse(JSON.stringify(options.middleEncoder.identity)) as EncoderIdentity);
+    const md = encoderIdentityDiff(docs.manifest.middleEmbedding, middleIdentity);
+    if (md.length) throw new RouterLoadError('ENCODER_IDENTITY_MISMATCH', 'the middle encoder does not implement the release middle encoder identity', md);
+  } else if (options.middleEncoder) throw new RouterLoadError('OPTIONS_INVALID', 'middleEncoder was supplied, but this release has no middle tier');
   if (docs.document) {
     if (!options.tokenizer) throw new RouterLoadError('CAPABILITY_MISSING', 'this is a document release: supply the tokenizer adapter for its pipeline');
     if (canonicalJson(options.tokenizer.identity ?? null) !== canonicalJson(docs.document.pipeline.tokenizer)) {
@@ -189,7 +242,10 @@ export async function loadRouter(options: LoadRouterOptions): Promise<Router> {
     { heads: Object.fromEntries(Object.entries(artifact.heads).map(([h, s]) => [h, { threshold: s!.threshold, reviewFloor: s!.review_floor }])) },
     policy,
   );
-  const snapshot: Snapshot = { manifest, manifestSha256: docs.manifestSha256, artifact, document, matcher: ruleSetMatcher(ruleSet), evaluator, identity };
+  const reviewer = options.review ? await makeReviewer(options.review, options.monitoring.samplingSalt, policy) : null;
+  const edgeTier = createEdgeTier(ruleSet, docs.edge ? deepFreeze(docs.edge) : null, policy.priority, await resolveStaticEncoder(docs.edge ?? null, options.staticEncoder));
+  const middle = docs.middle ? deepFreeze(docs.middle) : null;
+  const snapshot: Snapshot = { manifest, manifestSha256: docs.manifestSha256, artifact, document, edgeTier, middle, evaluator, identity, contextIdentity, middleIdentity, policy, reviewer };
   return new LoadedRouter(snapshot, options);
 }
 
@@ -198,9 +254,18 @@ interface Snapshot {
   manifestSha256: string;
   artifact: ClassifierArtifact;
   document: DocumentClassifierArtifact | null;
-  matcher: ReturnType<typeof ruleSetMatcher>;
+  /** The rules and the release's edge document, evaluated before any embedding. */
+  edgeTier: EdgeTier;
+  /** The middle tier (model tier only): fire/dismiss decisions on the middle encoder's vector. */
+  middle: MiddleDocument | null;
   evaluator: DecisionEvaluator;
   identity: Readonly<EncoderIdentity>;
+  /** Releases with context features: the context encoder's identity. */
+  contextIdentity: Readonly<EncoderIdentity> | null;
+  /** Releases with a middle tier: the middle encoder's identity. */
+  middleIdentity: Readonly<EncoderIdentity> | null;
+  policy: RouterPolicy;
+  reviewer: Reviewer | null;
 }
 
 class LoadedRouter implements Router {
@@ -209,6 +274,8 @@ class LoadedRouter implements Router {
   readonly mode: RouterMode;
   readonly #s: Snapshot;
   readonly #encoder: Encoder;
+  readonly #contextEncoder: Encoder | null;
+  readonly #middleEncoder: Encoder | null;
   readonly #timeoutMs: number;
   readonly #sampleRate: number;
   readonly #salt: string;
@@ -227,6 +294,8 @@ class LoadedRouter implements Router {
     this.manifestSha256 = snapshot.manifestSha256;
     this.mode = o.mode;
     this.#encoder = o.encoder;
+    this.#contextEncoder = snapshot.contextIdentity ? o.contextEncoder! : null;
+    this.#middleEncoder = snapshot.middleIdentity ? o.middleEncoder! : null;
     this.#timeoutMs = o.timeoutMs;
     this.#sampleRate = o.monitoring.sampleRate;
     this.#salt = o.monitoring.samplingSalt;
@@ -274,11 +343,12 @@ class LoadedRouter implements Router {
     const requestId = typeof forward?.requestId === 'string' ? forward.requestId : '';
     if (why) return this.#refuse(requestId, 'INVALID_INPUT');
     if (forward.manifestSha256 !== this.manifestSha256) return this.#refuse(requestId, 'RELEASE_MISMATCH');
-    if (forward.purpose === 'decide') return this.route({ text: forward.text, requestId, ...(options.signal ? { signal: options.signal } : {}) });
+    const context = forward.context !== undefined ? { context: forward.context } : {};
+    if (forward.purpose === 'decide') return this.route({ text: forward.text, ...context, requestId, ...(options.signal ? { signal: options.signal } : {}) });
     if (this.#drain.closed) return this.#refuse(requestId, 'CLOSED');
     // Telemetry only: the rules tier has already answered this request.
-    if (requestProblem({ text: forward.text, requestId }, requestId, this.#s.manifest, this.#s.document ? null : this.#s.identity) === null) {
-      this.#bg.run(this.#monitor(forward.text, this.#base(requestId, forward.inclusionProbability), forward.inclusionProbability));
+    if (requestProblem({ text: forward.text, ...context, requestId }, requestId, this.#s.manifest, this.#s.document ? null : this.#s.identity) === null) {
+      this.#bg.run(this.#monitor(forward.text, forward.context, this.#base(requestId, forward.inclusionProbability), forward.inclusionProbability));
     }
     return null;
   }
@@ -295,31 +365,76 @@ class LoadedRouter implements Router {
     // 1. Input and cancellation.
     const problem = requestProblem(request, requestId, s.manifest, s.document ? null : s.identity);
     if (problem) return fail(problem);
-    const text = request.text;
+    const text = request.text, context = request.context;
 
     // 2-3. Rules on the original text; conservative settlement.
     const tr = now();
-    const found = s.matcher.evaluate(text);
-    const rules: RuleFindings = { fired: found.fired, dismissed: found.dismissed };
-    const settled = s.evaluator.settle(rules);
+    let found: ReturnType<EdgeTier['evaluate']>;
+    try {
+      found = s.edgeTier.evaluate(text);
+    } catch {
+      return fail('PREPROCESSING_FAILURE', { timings: { totalMs: now() - t0, rulesMs: now() - tr, embedMs: null, scoreMs: null } });
+    }
+    let rules: RuleFindings = found.findings;
+    let settled = s.evaluator.settle(rules);
     const rulesMs = now() - tr;
-    const ruleFields = { firedRule: rules.fired?.id ?? null, dismissed: rules.dismissed };
+    let ruleFields: Pick<DecisionEvent, 'firedRule' | 'dismissed' | 'edge' | 'middle'> = { firedRule: rules.fired?.id ?? null, dismissed: rules.dismissed, ...(found.edge ? { edge: found.edge } : {}) };
+    let settledBy: 'rules' | 'middle' | null = settled ? 'rules' : null;
+
+    // 3b. The middle tier (model tier): the heads the rules and the edge left, decided on the middle
+    // encoder's vector, then settlement again. One deadline covers it and the main embedding.
+    const deadline = now() + this.#timeoutMs;
+    let middleMs: number | null = null;
+    if (!settled && s.middle) {
+      const heads = middleHeads(s.middle, found);
+      if (heads.length) {
+        const tm = now();
+        let vector: readonly number[];
+        try {
+          vector = await this.#embed(this.#middleEncoder!, s.middleIdentity!, text, request.signal, this.#timeoutMs);
+        } catch (e) {
+          const f = e instanceof RuntimeFailure ? e : new RuntimeFailure('ENCODER_FAILURE');
+          return fail(f.code, { ...ruleFields, timings: { totalMs: now() - t0, rulesMs, embedMs: null, scoreMs: null, middleMs: now() - tm } }, f.retryable);
+        }
+        const decided = middleDecisions(s.middle, vector, heads);
+        rules = mergeMiddle(found, decided, s.policy.priority);
+        middleMs = now() - tm;
+        ruleFields = { ...ruleFields, firedRule: rules.fired?.id ?? null, dismissed: rules.dismissed, middle: decided };
+        settled = s.evaluator.settle(rules);
+        if (settled) settledBy = 'middle';
+      }
+    }
+    const middleTiming = middleMs !== null ? { middleMs } : {};
 
     if (settled) {
       const sampled = await selectedForMonitoring(this.releaseId, this.#salt, this.#sampleRate, requestId);
-      this.#bg.emit(decisionEvent(base, settled, { ...ruleFields, rulesSettled: true, sampled, embedded: false, inclusionProbability: this.#sampleRate, errorCode: null, timings: { totalMs: now() - t0, rulesMs, embedMs: null, scoreMs: null } }));
-      // The decision doesn't need the embedding, so the response doesn't wait for it.
-      if (sampled) this.#bg.run(this.#monitor(text, base, this.#sampleRate));
-      return wrapCandidate(this.mode, this.releaseId, requestId, settled, false);
+      let final = settled;
+      let review: DecisionEvent['review'];
+      let reviewMs: number | null = null;
+      if (settled.outcome === 'review' && s.reviewer) {
+        const r = await answerReview(s.reviewer, settled, { text, fired: rules.fired, dismissed: rules.dismissed, probabilities: {}, releaseId: this.releaseId, requestId, ...(request.signal ? { signal: request.signal } : {}) });
+        final = r.candidate;
+        review = r.review;
+        reviewMs = r.reviewMs;
+      }
+      this.#bg.emit(decisionEvent(base, final, {
+        ...ruleFields, rulesSettled: settledBy === 'rules', settledBy, sampled, embedded: false, inclusionProbability: this.#sampleRate, errorCode: null,
+        timings: { totalMs: now() - t0, rulesMs, embedMs: null, scoreMs: null, ...middleTiming, ...(review ? { reviewMs } : {}) }, ...(review ? { review } : {}),
+      }));
+      // The decision doesn't need the main embedding, so the response doesn't wait for it.
+      if (sampled) this.#bg.run(this.#monitor(text, context, base, this.#sampleRate));
+      return wrapCandidate(this.mode, this.releaseId, requestId, final, false);
     }
 
-    // 4. Embed and score within the deadline.
+    // 4. Embed and score within what is left of the deadline.
     let scored: Scored;
     try {
-      scored = await this.#embedAndScore(text, request.signal, this.#timeoutMs);
+      const remaining = Math.floor(deadline - now());
+      if (remaining < 1) throw new RuntimeFailure('ENCODER_TIMEOUT');
+      scored = await this.#embedAndScore(text, context, request.signal, remaining);
     } catch (e) {
       const f = e instanceof RuntimeFailure ? e : new RuntimeFailure('ENCODER_FAILURE');
-      return fail(f.code, { ...ruleFields, timings: { totalMs: now() - t0, rulesMs, embedMs: null, scoreMs: null } }, f.retryable);
+      return fail(f.code, { ...ruleFields, timings: { totalMs: now() - t0, rulesMs, embedMs: null, scoreMs: null, ...middleTiming } }, f.retryable);
     }
     // 5-7. Decision.
     let candidate: Candidate;
@@ -327,12 +442,21 @@ class LoadedRouter implements Router {
       candidate = s.evaluator.decide(rules, scored.scores);
     } catch (e) {
       if (!(e instanceof ScoreError)) throw e;
-      return fail('INVALID_SCORE', { ...ruleFields, embedded: true, timings: { totalMs: now() - t0, rulesMs, embedMs: scored.embedMs, scoreMs: scored.scoreMs } });
+      return fail('INVALID_SCORE', { ...ruleFields, embedded: true, timings: { totalMs: now() - t0, rulesMs, embedMs: scored.embedMs, scoreMs: scored.scoreMs, ...middleTiming } });
+    }
+    let review: DecisionEvent['review'];
+    let reviewMs: number | null = null;
+    if (candidate.outcome === 'review' && s.reviewer) {
+      const r = await answerReview(s.reviewer, candidate, { text, fired: rules.fired, dismissed: rules.dismissed, probabilities: scored.scores as Record<string, number>, releaseId: this.releaseId, requestId, ...(request.signal ? { signal: request.signal } : {}) });
+      candidate = r.candidate;
+      review = r.review;
+      reviewMs = r.reviewMs;
     }
     this.#bg.emit(decisionEvent(base, candidate, {
-      ...ruleFields, rulesSettled: false, sampled: false, embedded: true, inclusionProbability: 1, errorCode: null,
-      timings: { totalMs: now() - t0, rulesMs, embedMs: scored.embedMs, scoreMs: scored.scoreMs }, calibratedProbabilities: Object.freeze({ ...scored.scores }) as Record<string, number>,
-      ...(scored.document ? { document: scored.document } : {}),
+      ...ruleFields, rulesSettled: false, settledBy: null, sampled: false, embedded: true, inclusionProbability: 1, errorCode: null,
+      timings: { totalMs: now() - t0, rulesMs, embedMs: scored.embedMs, scoreMs: scored.scoreMs, ...middleTiming, ...(review ? { reviewMs } : {}) },
+      calibratedProbabilities: Object.freeze({ ...scored.scores }) as Record<string, number>,
+      ...(scored.document ? { document: scored.document } : {}), ...(review ? { review } : {}),
     }));
     return wrapCandidate(this.mode, this.releaseId, requestId, candidate, true);
   }
@@ -341,10 +465,10 @@ class LoadedRouter implements Router {
    * Embeds a settled request for monitoring, after its result was returned, so the request's signal no
    * longer applies: monitoring.timeoutMs bounds it. Reports and swallows every failure.
    */
-  async #monitor(text: string, base: EventContext, inclusionProbability: number): Promise<void> {
+  async #monitor(text: string, context: string | undefined, base: EventContext, inclusionProbability: number): Promise<void> {
     const t = now();
     try {
-      const { scores, embedMs, scoreMs, document } = await this.#embedAndScore(text, undefined, this.#monitorTimeoutMs);
+      const { scores, embedMs, scoreMs, document } = await this.#embedAndScore(text, context, undefined, this.#monitorTimeoutMs);
       let classifierCandidate: { outcome: 'route' | 'review' | 'abstain'; routeId: string | null };
       try {
         const c = this.#s.evaluator.decide({ fired: null, dismissed: [] }, scores);
@@ -360,11 +484,17 @@ class LoadedRouter implements Router {
     }
   }
 
-  /** Scores for the release's classifier: one vector (legacy) or the shared document scorer (document releases). */
-  async #embedAndScore(text: string, signal: AbortSignal | undefined, timeoutMs: number): Promise<Scored> {
+  /**
+   * Scores for the release's classifier: one vector (legacy), the message's and its context's vectors
+   * concatenated (context features; embedded in parallel under one deadline), or the shared document
+   * scorer (document releases).
+   */
+  async #embedAndScore(text: string, context: string | undefined, signal: AbortSignal | undefined, timeoutMs: number): Promise<Scored> {
     if (this.#s.document) return this.#scoreDocument(this.#s.document, text, signal, timeoutMs);
     const te = now();
-    const vector = await this.#embed(text, signal, timeoutMs);
+    const vector = context === undefined || !this.#contextEncoder
+      ? await this.#embed(this.#encoder, this.#s.identity, text, signal, timeoutMs)
+      : (await Promise.all([this.#embed(this.#encoder, this.#s.identity, text, signal, timeoutMs), this.#embed(this.#contextEncoder, this.#s.contextIdentity!, context, signal, timeoutMs)])).flat();
     const embedMs = now() - te;
     const ts = now();
     let scores: Scores;
@@ -430,7 +560,7 @@ class LoadedRouter implements Router {
   }
 
   /** One validated vector, or a RuntimeFailure (ABORTED, ENCODER_TIMEOUT, ENCODER_FAILURE, INVALID_EMBEDDING). */
-  async #embed(text: string, outer: AbortSignal | undefined, timeoutMs: number): Promise<readonly number[]> {
+  async #embed(encoder: Encoder, identity: Readonly<EncoderIdentity>, text: string, outer: AbortSignal | undefined, timeoutMs: number): Promise<readonly number[]> {
     if (outer?.aborted) throw new RuntimeFailure('ABORTED');
     const controller = new AbortController();
     let why: RuntimeErrorCode | null = null;
@@ -447,7 +577,7 @@ class LoadedRouter implements Router {
     outer?.addEventListener('abort', onAbort, { once: true });
     let rows: unknown;
     try {
-      const call = Promise.resolve().then(() => this.#encoder.embed([text], { signal: controller.signal }));
+      const call = Promise.resolve().then(() => encoder.embed([text], { signal: controller.signal }));
       call.catch(() => {});
       rows = await Promise.race([call, stopped]);
     } catch (e) {
@@ -459,7 +589,7 @@ class LoadedRouter implements Router {
       outer?.removeEventListener('abort', onAbort);
     }
     if (!Array.isArray(rows) || rows.length !== 1) throw new RuntimeFailure('INVALID_EMBEDDING');
-    if (vectorProblems(this.#s.identity, rows[0]) !== null) throw new RuntimeFailure('INVALID_EMBEDDING');
+    if (vectorProblems(identity, rows[0]) !== null) throw new RuntimeFailure('INVALID_EMBEDDING');
     return rows[0] as readonly number[];
   }
 }
