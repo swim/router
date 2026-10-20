@@ -44,6 +44,7 @@
   "dependencies": {
     "@liquidau/embedding-classifier": "^0.8.0",
     "@liquidau/rule-miner": "^0.5.1",
+    "@liquidau/solvers": "^0.6.2",
     "@liquidau/text-preprocessing": "^0.1.0"
   },
   "devDependencies": {

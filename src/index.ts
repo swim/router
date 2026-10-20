@@ -29,3 +29,5 @@ export type { ReviewAdapter, ReviewAdapterIdentity, ReviewAnswer, ReviewAnswerFi
 export { canonicalJson, encodeJson, sha256Hex } from './bytes.ts';
 export { createEdgeTier, mergeMiddle, middleDecisions, middleHeads, resolveStaticEncoder, staticEncoderProblems, type StaticEncoderOption } from './edge-tier.ts';
 export type { EdgeFindings, EdgeTier } from './edge-tier.ts';
+export { checkWindow, windowOf } from './monitoring.ts';
+export type { TelemetryWindow, WindowCheck, WindowReport } from './monitoring.ts';

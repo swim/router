@@ -116,6 +116,38 @@ mechanism, rule, probabilities, timings) and a diagnostic event per monitoring s
 contain the request text. `inclusionProbability` on each event says how the scored traffic was
 sampled. `telemetry()` counts delivered and dropped events.
 
+**Drift checks.** Store the events, and check each window (an hour, a day, N requests) against a
+reference window: the release's own traffic, routed by the same release.
+
+```ts
+import { checkWindow, windowOf } from '@liquidau/router';
+
+// From the release: its rule set, the head names, and each head's { threshold, review_floor }.
+const thresholds = Object.fromEntries(Object.entries(classifier.heads).map(([h, s]) => [h, { threshold: s.threshold, review_floor: s.review_floor }]));
+const heads = Object.keys(thresholds);
+const labelOf = (ruleId: string) => rules.rules.find((r) => r.id === ruleId)?.label;
+const reference = windowOf(referenceEvents, heads, labelOf);
+const report = checkWindow(reference, windowOf(liveEvents, heads, labelOf), thresholds, { alpha: 0.01 });
+if (report.retrain.recommended) { /* label a fresh sample, train, release, shadow, promote */ }
+if (report.investigate.length) { /* the service is failing: retraining won't help */ }
+```
+
+- **What is compared.**
+  - Scores, per head, in two strata kept apart so no weighting is needed: the requests the router scored,
+    and the monitoring sample of rules-settled requests (with embedding-classifier's `monitorWindow`).
+  - The rates the scores never see: the share settled without the model, each label's rule firing, the
+    edge tier's fires and dismissals per label, and unavailable results.
+  - Watch the edge's rates in particular. When the edge settles most traffic, a surge in one label shows
+    up in its fires and dismissals, not in the scores. In the lab, a surge of account-access requests on
+    ABCD raised no alert until these rates were checked.
+- **The false-alarm rate.** All checks share one family-wise false-alarm rate (`alpha`, Bonferroni).
+- **What an alert means.** A drift alert recommends retraining. An alert on unavailable results says to
+  investigate the encoder or the release source instead.
+- **Thin strata.** A score stratum with fewer than `minScores` (default 30) scores in either window is
+  skipped and listed in `skipped`. At a 5% monitoring rate, that is about 600 rules-settled requests per
+  window.
+- **Dropped events.** `telemetry().dropped` weakens every check, so watch it too.
+
 ## Split deployment
 
 The rules can run in their own small function in front of the model's function:
